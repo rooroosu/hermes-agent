@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -1057,6 +1058,34 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+# Bounded retry-on-timeout for the CRON standalone-fallback send below only.
+#
+# tools/send_message_tool.py:_telegram_retry_delay() deliberately returns
+# None (non-retryable) for "timed out"/"timeout" text on the *interactive*
+# send path, because retrying there risks delivering the same message twice
+# to a user who is actively watching the chat. A cron job has no one watching
+# in real time, and the standalone fallback below is a single unattended
+# asyncio.run() — a transient network timeout there currently means the
+# scheduled delivery is permanently lost for that run. So this cron call site
+# gets its own small, LOCAL retry that mirrors the timeout-text match used by
+# _telegram_retry_delay() but is intentionally not shared with it, and does
+# not touch the interactive path at all.
+_CRON_STANDALONE_TIMEOUT_RETRY_ATTEMPTS = 3  # 1 initial attempt + 2 retries
+_CRON_STANDALONE_TIMEOUT_RETRY_DELAY_S = 2.5  # seconds between retries
+
+
+def _is_cron_standalone_timeout_error(exc: Exception) -> bool:
+    """True if ``exc`` looks like a transient timeout (case-insensitive).
+
+    Scoped to the cron standalone-fallback retry in ``_deliver_result`` only —
+    see the module comment above. Mirrors the substring check in
+    ``tools/send_message_tool.py:_telegram_retry_delay()`` without importing
+    or altering it.
+    """
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1461,24 +1490,50 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
-            try:
-                result = asyncio.run(coro)
-            except RuntimeError:
-                # asyncio.run() checks for a running loop before awaiting the coroutine;
-                # when it raises, the original coro was never started — close it to
-                # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-                # fresh thread that has no running loop.
-                coro.close()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
-                    result = future.result(timeout=30)
-            except Exception as e:
-                msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                target_errors.extend([msg])
-                delivery_errors.extend(target_errors)
+            # Standalone path: run the async send in a fresh event loop (safe from any thread).
+            # Retries ONLY when the exception text looks like a transient timeout —
+            # scoped to this cron fallback call site (see _is_cron_standalone_timeout_error
+            # and the module comment above _deliver_result). The interactive send path in
+            # tools/send_message_tool.py:_telegram_retry_delay() is untouched and still
+            # treats timeouts as non-retryable there.
+            send_failed = False
+            for attempt in range(_CRON_STANDALONE_TIMEOUT_RETRY_ATTEMPTS):
+                coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+                try:
+                    result = asyncio.run(coro)
+                    send_failed = False
+                    break
+                except RuntimeError:
+                    # asyncio.run() checks for a running loop before awaiting the coroutine;
+                    # when it raises, the original coro was never started — close it to
+                    # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
+                    # fresh thread that has no running loop.
+                    coro.close()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        result = future.result(timeout=30)
+                    send_failed = False
+                    break
+                except Exception as e:
+                    send_failed = True
+                    is_last_attempt = attempt >= _CRON_STANDALONE_TIMEOUT_RETRY_ATTEMPTS - 1
+                    if not is_last_attempt and _is_cron_standalone_timeout_error(e):
+                        logger.warning(
+                            "Job '%s': standalone delivery to %s:%s timed out "
+                            "(attempt %d/%d), retrying in %.1fs: %s",
+                            job["id"], platform_name, chat_id, attempt + 1,
+                            _CRON_STANDALONE_TIMEOUT_RETRY_ATTEMPTS,
+                            _CRON_STANDALONE_TIMEOUT_RETRY_DELAY_S, e,
+                        )
+                        time.sleep(_CRON_STANDALONE_TIMEOUT_RETRY_DELAY_S)
+                        continue
+                    msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    target_errors.extend([msg])
+                    delivery_errors.extend(target_errors)
+                    break
+
+            if send_failed:
                 continue
 
             if result and result.get("error"):

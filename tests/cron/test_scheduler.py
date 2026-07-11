@@ -955,6 +955,102 @@ class TestDeliverResultErrorReturns:
         assert "no delivery target" in result
 
 
+class TestCronStandaloneTimeoutRetry:
+    """The standalone-fallback send (no live gateway adapter) retries a small,
+    bounded number of times ONLY when the failure looks like a transient
+    timeout — scoped to this cron call site (#38922-adjacent follow-up: a
+    permanent Telegram delivery failure on a transient 'Timed out').
+
+    tools/send_message_tool.py:_telegram_retry_delay() intentionally treats
+    timeouts as non-retryable on the *interactive* send path (duplicate
+    live messages are worse than a drop). These tests only cover the cron
+    scheduler's standalone fallback and must never exercise or assert on the
+    interactive path.
+    """
+
+    @staticmethod
+    def _mock_cfg():
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        return mock_cfg
+
+    def test_timeout_on_first_attempt_is_retried_and_succeeds(self, monkeypatch):
+        """A 'Timed out' exception on attempt 1 is retried; attempt 2 succeeds."""
+        from cron.scheduler import _CRON_STANDALONE_TIMEOUT_RETRY_DELAY_S
+
+        sleeps = []
+        monkeypatch.setattr("cron.scheduler.time.sleep", lambda s: sleeps.append(s))
+
+        send_mock = AsyncMock(side_effect=[Exception("Timed out"), {"success": True}])
+
+        job = {
+            "id": "timeout-retry-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._mock_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(job, "Hello world")
+
+        assert result is None, f"expected successful delivery after retry, got: {result!r}"
+        assert send_mock.await_count == 2, "expected exactly one retry after the timeout"
+        assert sleeps == [_CRON_STANDALONE_TIMEOUT_RETRY_DELAY_S]
+
+    def test_persistent_timeout_gives_up_after_bounded_attempts(self, monkeypatch):
+        """A timeout on every attempt is retried up to the bound, then reported
+        as a delivery error — never retried forever."""
+        from cron.scheduler import _CRON_STANDALONE_TIMEOUT_RETRY_ATTEMPTS
+
+        monkeypatch.setattr("cron.scheduler.time.sleep", lambda s: None)
+
+        send_mock = AsyncMock(side_effect=Exception("Read timed out"))
+
+        job = {
+            "id": "timeout-exhausted-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._mock_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(job, "Hello world")
+
+        assert result is not None
+        assert "failed" in result
+        assert send_mock.await_count == _CRON_STANDALONE_TIMEOUT_RETRY_ATTEMPTS
+
+    def test_non_timeout_exception_is_not_retried(self, monkeypatch):
+        """A non-timeout failure (e.g. bad token, network refused) must fail
+        immediately, with no retry delay — only timeout-shaped errors retry."""
+        sleeps = []
+        monkeypatch.setattr("cron.scheduler.time.sleep", lambda s: sleeps.append(s))
+
+        send_mock = AsyncMock(side_effect=Exception("Unauthorized"))
+
+        job = {
+            "id": "non-timeout-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=self._mock_cfg()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(job, "Hello world")
+
+        assert result is not None
+        assert "failed" in result
+        assert send_mock.await_count == 1, "non-timeout errors must not be retried"
+        assert sleeps == []
+
+
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
