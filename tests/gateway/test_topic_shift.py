@@ -305,8 +305,15 @@ def test_reply_wrapper_and_appended_gateway_controls_are_both_removed():
 
 def test_leading_discord_trigger_message_id_is_removed_before_topic_classification():
     assert _clean_real_user_text(
-        "[Triggering message id: 123456789012345678]\n\n그 압축 수정 상태를 알려줘."
+        "[Triggering message id: `abc-123` — use as `message_id` for reply/react/pin via the discord tools.]\n\n"
+        "그 압축 수정 상태를 알려줘."
     ) == "그 압축 수정 상태를 알려줘."
+
+
+def test_discord_trigger_message_id_phrase_later_in_text_is_preserved():
+    ordinary_text = "본문 중간의 [Triggering message id: `abc-123` — use as `message_id` for reply/react/pin via the discord tools.] 표현은 유지해줘."
+
+    assert _clean_real_user_text(ordinary_text) == ordinary_text
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,9 @@ _GATEWAY_REPLY_WRAPPER_PREFIXES = (
 )
 _MAX_GATEWAY_REPLY_QUOTE_CHARS = 500
 _GATEWAY_LEADING_SEPARATOR = re.compile(r"^\r?\n[ \t]*\r?\n")
-_DISCORD_TRIGGER_MESSAGE_ID = re.compile(r"^\[Triggering message id: [0-9]+\]\r?\n[ \t]*\r?\n")
+_DISCORD_TRIGGER_MESSAGE_ID = re.compile(
+    r"^\[Triggering message id: `[^`\r\n]+` — use as `message_id` for reply/react/pin via the discord tools\.\]\r?\n[ \t]*\r?\n"
+)
 
 
 class TopicShiftDecision(str, Enum):
