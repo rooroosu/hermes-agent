@@ -201,12 +201,12 @@ def _strip_leading_gateway_reply_wrapper(text: str) -> str:
         return text
 
     quote_end_limit = len(prefix) + _MAX_GATEWAY_REPLY_QUOTE_CHARS
-    wrapper_end = text.find('"]', len(prefix), quote_end_limit + 1)
+    wrapper_end = text.find('"]', len(prefix), quote_end_limit + 2)
     while wrapper_end >= 0:
         separator = _GATEWAY_LEADING_SEPARATOR.match(text[wrapper_end + 2 :])
         if separator is not None:
             return text[wrapper_end + 2 + separator.end() :]
-        wrapper_end = text.find('"]', wrapper_end + 2, quote_end_limit + 1)
+        wrapper_end = text.find('"]', wrapper_end + 2, quote_end_limit + 2)
     return text
 
 

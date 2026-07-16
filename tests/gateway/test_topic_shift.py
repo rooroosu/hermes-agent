@@ -285,6 +285,18 @@ def test_multiline_previous_reply_wrapper_is_removed_before_topic_classification
     ) == "압축 수정 상태를 알려줘."
 
 
+def test_reply_wrapper_with_exactly_500_quoted_characters_is_removed():
+    assert _clean_real_user_text(
+        '[Replying to: "' + ("x" * 500) + '"]\n\nGive me the status of that fix.'
+    ) == "Give me the status of that fix."
+
+
+def test_reply_wrapper_with_501_quoted_characters_is_preserved_conservatively():
+    wrapped_text = '[Replying to: "' + ("x" * 501) + '"]\n\nGive me the status of that fix.'
+
+    assert _clean_real_user_text(wrapped_text).startswith('[Replying to: "')
+
+
 def test_reply_wrapper_with_internal_closing_token_is_removed_before_topic_classification():
     assert _clean_real_user_text(
         '[Replying to: "please keep this token: \"] in docs"]\n\n'
