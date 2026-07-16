@@ -272,6 +272,43 @@ def test_completion_guard_marker_removes_appended_control_text():
     ) == "압축 작업 상태를 알려줘."
 
 
+def test_reply_wrapper_is_removed_before_topic_classification():
+    assert _clean_real_user_text(
+        '[Replying to: "제주 여행 일정"]\n\n그 압축 수정 상태를 알려줘.'
+    ) == "그 압축 수정 상태를 알려줘."
+
+
+def test_multiline_previous_reply_wrapper_is_removed_before_topic_classification():
+    assert _clean_real_user_text(
+        '[Replying to your previous message: "제주 여행 일정\n비 오는 날 대안도 포함"]\n\n'
+        "압축 수정 상태를 알려줘."
+    ) == "압축 수정 상태를 알려줘."
+
+
+def test_reply_wrapper_words_in_ordinary_user_text_are_preserved():
+    ordinary_text = "문서 중간에 [Replying to: 라는 표현이 있어도 그대로 남겨줘."
+
+    assert _clean_real_user_text(ordinary_text) == ordinary_text
+
+
+def test_malformed_leading_reply_wrapper_is_preserved_conservatively():
+    malformed_text = '[Replying to: "제주 여행 일정"] 실제 요청도 같은 줄에 있습니다.'
+
+    assert _clean_real_user_text(malformed_text) == malformed_text
+
+
+def test_reply_wrapper_and_appended_gateway_controls_are_both_removed():
+    assert _clean_real_user_text(
+        '[Replying to: "제주 여행 일정"]\n\n그 압축 수정 상태를 알려줘.' + _GATEWAY_CONTROL_BLOCK
+    ) == "그 압축 수정 상태를 알려줘."
+
+
+def test_leading_discord_trigger_message_id_is_removed_before_topic_classification():
+    assert _clean_real_user_text(
+        "[Triggering message id: 123456789012345678]\n\n그 압축 수정 상태를 알려줘."
+    ) == "그 압축 수정 상태를 알려줘."
+
+
 @pytest.mark.asyncio
 async def test_same_topic_korean_status_wording_stays_same_with_mocked_classifier():
     decision = await classify_topic_shift(

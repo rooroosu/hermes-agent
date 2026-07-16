@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
@@ -34,6 +35,13 @@ _APPENDED_CONTROL_PREFIXES = (
     "background execution contract:",
     "[completion guard active]",
 )
+_GATEWAY_REPLY_WRAPPER_PREFIXES = (
+    '[Replying to: "',
+    '[Replying to your previous message: "',
+)
+_MAX_GATEWAY_REPLY_QUOTE_CHARS = 500
+_GATEWAY_LEADING_SEPARATOR = re.compile(r"^\r?\n[ \t]*\r?\n")
+_DISCORD_TRIGGER_MESSAGE_ID = re.compile(r"^\[Triggering message id: [0-9]+\]\r?\n[ \t]*\r?\n")
 
 
 class TopicShiftDecision(str, Enum):
@@ -168,6 +176,8 @@ def _clean_real_user_text(content: Any) -> str:
     text = str(content or "").strip()
     if not text:
         return ""
+    text = _strip_leading_gateway_reply_wrapper(text)
+    text = _strip_leading_discord_trigger_message_id(text)
     lines = []
     for line in text.splitlines():
         stripped = line.lstrip()
@@ -180,6 +190,30 @@ def _clean_real_user_text(content: Any) -> str:
     if text.lower().startswith(_CONTROL_PREFIXES):
         return ""
     return " ".join(text.split())
+
+
+def _strip_leading_gateway_reply_wrapper(text: str) -> str:
+    """Remove a complete leading gateway reply wrapper and blank separator."""
+    prefix = next((item for item in _GATEWAY_REPLY_WRAPPER_PREFIXES if text.startswith(item)), None)
+    if prefix is None:
+        return text
+
+    wrapper_end = text.find('"]', len(prefix), len(prefix) + _MAX_GATEWAY_REPLY_QUOTE_CHARS + 2)
+    if wrapper_end < 0:
+        return text
+
+    separator = _GATEWAY_LEADING_SEPARATOR.match(text[wrapper_end + 2 :])
+    if separator is None:
+        return text
+    return text[wrapper_end + 2 + separator.end() :]
+
+
+def _strip_leading_discord_trigger_message_id(text: str) -> str:
+    """Remove only a complete leading Discord trigger pointer and separator."""
+    pointer = _DISCORD_TRIGGER_MESSAGE_ID.match(text)
+    if pointer is None:
+        return text
+    return text[pointer.end() :]
 
 
 def _render_classifier_input(recent_turns: Sequence[str], incoming_text: str) -> str:
