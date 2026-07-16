@@ -285,6 +285,20 @@ def test_multiline_previous_reply_wrapper_is_removed_before_topic_classification
     ) == "압축 수정 상태를 알려줘."
 
 
+def test_reply_wrapper_with_internal_closing_token_is_removed_before_topic_classification():
+    assert _clean_real_user_text(
+        '[Replying to: "please keep this token: \"] in docs"]\n\n'
+        "Give me the status of that fix."
+    ) == "Give me the status of that fix."
+
+
+def test_multiline_reply_wrapper_skips_internal_closing_token_before_final_boundary():
+    assert _clean_real_user_text(
+        '[Replying to your previous message: "first line with \"] inside\nsecond line"]\n\n'
+        "Give me the status of that fix."
+    ) == "Give me the status of that fix."
+
+
 def test_reply_wrapper_words_in_ordinary_user_text_are_preserved():
     ordinary_text = "문서 중간에 [Replying to: 라는 표현이 있어도 그대로 남겨줘."
 

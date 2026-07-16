@@ -200,14 +200,14 @@ def _strip_leading_gateway_reply_wrapper(text: str) -> str:
     if prefix is None:
         return text
 
-    wrapper_end = text.find('"]', len(prefix), len(prefix) + _MAX_GATEWAY_REPLY_QUOTE_CHARS + 2)
-    if wrapper_end < 0:
-        return text
-
-    separator = _GATEWAY_LEADING_SEPARATOR.match(text[wrapper_end + 2 :])
-    if separator is None:
-        return text
-    return text[wrapper_end + 2 + separator.end() :]
+    quote_end_limit = len(prefix) + _MAX_GATEWAY_REPLY_QUOTE_CHARS
+    wrapper_end = text.find('"]', len(prefix), quote_end_limit + 1)
+    while wrapper_end >= 0:
+        separator = _GATEWAY_LEADING_SEPARATOR.match(text[wrapper_end + 2 :])
+        if separator is not None:
+            return text[wrapper_end + 2 + separator.end() :]
+        wrapper_end = text.find('"]', wrapper_end + 2, quote_end_limit + 1)
+    return text
 
 
 def _strip_leading_discord_trigger_message_id(text: str) -> str:
