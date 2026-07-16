@@ -1,0 +1,276 @@
+"""Unit tests for gateway topic-shift preflight decisions."""
+
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.topic_shift import (
+    TopicShiftConfig,
+    TopicShiftDecision,
+    classify_topic_shift,
+    extract_recent_real_user_turns,
+    is_topic_shift_candidate,
+)
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.session import SessionEntry, SessionSource
+
+
+def _history(count: int, content: str = "Working on the gateway compression bug.") -> list[dict]:
+    return [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": content,
+        }
+        for index in range(count)
+    ]
+
+
+def _response(text: str):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+    )
+
+
+class _CaptureAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        return SendResult(success=True, message_id="topic-shift-test")
+
+    async def get_chat_info(self, chat_id: str):
+        return {"id": chat_id}
+
+
+@pytest.mark.asyncio
+async def test_gateway_topic_shift_compresses_once_and_preserves_incoming_message(monkeypatch, tmp_path):
+    """A confirmed long-session shift uses hygiene compression before one agent run."""
+    import gateway.run as gateway_run
+
+    class _CompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self.context_compressor = SimpleNamespace(bind_session_state=lambda *_args: None)
+            self.shutdown_memory_provider = lambda: None
+            self.close = lambda: None
+            self._last_compaction_in_place = False
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            return ([{"role": "assistant", "content": "compressed"}], None)
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "classify_topic_shift", AsyncMock(return_value=TopicShiftDecision.SHIFT))
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr("run_agent.AIAgent", _CompressAgent)
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *_args, **_kwargs: 1_000_000)
+    (tmp_path / "config.yaml").write_text(
+        "compression:\n  topic_shift:\n    enabled: true\n    min_messages: 80\n    min_tokens: 80000\n"
+    )
+
+    entry = SessionEntry(
+        session_key="agent:main:telegram:private:12345",
+        session_id="topic-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="private",
+    )
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")})
+    runner.adapters = {Platform.TELEGRAM: _CaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda *_args, **_kwargs: entry,
+        load_transcript=lambda *_args: _history(80),
+        has_any_sessions=lambda: True,
+        rewrite_transcript=lambda *_args: None,
+        append_to_transcript=lambda *_args, **_kwargs: None,
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+        load_transcript=AsyncMock(return_value=_history(80)),
+        has_any_sessions=AsyncMock(return_value=True),
+        _save=AsyncMock(),
+        rewrite_transcript=AsyncMock(),
+        append_to_transcript=AsyncMock(),
+        update_session=AsyncMock(),
+    )
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(return_value={"final_response": "ok", "messages": [], "tools": []})
+
+    incoming = "완전히 별개로 제주 여행 일정을 만들어줘."
+    event = MessageEvent(
+        text=incoming,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="private", user_id="12345"),
+        message_id="1",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    gateway_run.classify_topic_shift.assert_awaited_once()
+    assert _CompressAgent.last_instance is not None
+    runner._run_agent.assert_awaited_once()
+    assert runner._run_agent.await_args.kwargs["message"] == incoming
+
+
+def test_short_session_does_not_become_topic_candidate():
+    config = TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000)
+
+    assert not is_topic_shift_candidate(
+        _history(10), "Plan a vacation to Jeju.", config, estimated_tokens=100
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_session_does_not_call_detector():
+    classifier = AsyncMock(return_value=_response("SHIFT"))
+
+    decision = await classify_topic_shift(
+        _history(10),
+        "Plan a vacation to Jeju.",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=classifier,
+    )
+
+    assert decision is TopicShiftDecision.AMBIGUOUS
+    classifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_long_session_same_does_not_trigger_topic_compaction():
+    decision = await classify_topic_shift(
+        _history(80),
+        "Can you give me the status of that compression fix?",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=AsyncMock(return_value=_response("SAME")),
+    )
+
+    assert decision is TopicShiftDecision.SAME
+
+
+@pytest.mark.asyncio
+async def test_long_session_shift_triggers_topic_compaction_decision():
+    decision = await classify_topic_shift(
+        _history(80),
+        "Draft a menu for a vegetarian dinner party.",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=AsyncMock(return_value=_response("SHIFT")),
+    )
+
+    assert decision is TopicShiftDecision.SHIFT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ["AMBIGUOUS", "same because uncertain", "", "SHIFT\nextra"])
+async def test_ambiguous_or_malformed_detector_output_fails_open(result):
+    decision = await classify_topic_shift(
+        _history(80),
+        "Draft a menu for a vegetarian dinner party.",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=AsyncMock(return_value=_response(result)),
+    )
+
+    assert decision is TopicShiftDecision.AMBIGUOUS
+
+
+@pytest.mark.asyncio
+async def test_detector_failure_fails_open():
+    decision = await classify_topic_shift(
+        _history(80),
+        "Draft a menu for a vegetarian dinner party.",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=AsyncMock(side_effect=TimeoutError()),
+    )
+
+    assert decision is TopicShiftDecision.AMBIGUOUS
+
+
+def test_recent_user_turns_exclude_compression_and_control_boilerplate():
+    history = [
+        {"role": "user", "content": "Implement the gateway topic compaction feature."},
+        {"role": "assistant", "content": "I will inspect the code."},
+        {"role": "user", "content": "Background execution contract:\nDo not claim completion."},
+        {"role": "user", "content": "Completion guard: verification pending."},
+        {"role": "user", "content": "[Context summary]\nOld task details."},
+        {"role": "user", "content": "Ignored metadata summary.", "_compressed_summary": True},
+        {"role": "user", "content": "> quoted prior message\n\nCurrent real follow-up"},
+    ]
+
+    assert extract_recent_real_user_turns(history) == [
+        "Implement the gateway topic compaction feature.",
+        "Current real follow-up",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_same_topic_korean_status_wording_stays_same_with_mocked_classifier():
+    decision = await classify_topic_shift(
+        _history(80),
+        "그 압축 수정 작업 상태를 알려줘.",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=AsyncMock(return_value=_response("SAME")),
+    )
+
+    assert decision is TopicShiftDecision.SAME
+
+
+@pytest.mark.asyncio
+async def test_unrelated_korean_objective_is_shift_with_mocked_classifier():
+    decision = await classify_topic_shift(
+        _history(80),
+        "완전히 별개로 제주 여행 일정을 만들어줘.",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=AsyncMock(return_value=_response("SHIFT")),
+    )
+
+    assert decision is TopicShiftDecision.SHIFT
+
+
+@pytest.mark.asyncio
+async def test_slash_command_is_excluded_from_detector():
+    classifier = AsyncMock(return_value=_response("SHIFT"))
+
+    decision = await classify_topic_shift(
+        _history(80),
+        "/status",
+        TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000),
+        estimated_tokens=100,
+        auxiliary_call=classifier,
+    )
+
+    assert decision is TopicShiftDecision.AMBIGUOUS
+    classifier.assert_not_awaited()
+
+
+def test_topic_config_defaults_disabled_and_candidate_uses_message_or_token_gate():
+    config = TopicShiftConfig.from_compression_config({})
+    assert config == TopicShiftConfig(enabled=False, min_messages=80, min_tokens=80_000)
+
+    enabled = TopicShiftConfig(enabled=True, min_messages=80, min_tokens=80_000)
+    assert is_topic_shift_candidate(_history(80), "new objective", enabled, estimated_tokens=1)
+    assert is_topic_shift_candidate(_history(1), "new objective", enabled, estimated_tokens=80_000)

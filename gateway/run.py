@@ -58,6 +58,11 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.topic_shift import (
+    TopicShiftConfig,
+    TopicShiftDecision,
+    classify_topic_shift,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -11008,6 +11013,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
 
+        # Keep the raw user message for topic-shift classification. Topic-bound
+        # skill payloads below are synthetic context, not user intent.
+        _topic_shift_incoming_text = event.text
+
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
         # Only inject on NEW sessions — ongoing conversations already have the
@@ -11084,6 +11093,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
+            _hyg_runtime = {}
+            _topic_shift_config = TopicShiftConfig()
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -11114,6 +11125,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        _topic_shift_config = TopicShiftConfig.from_compression_config(
+                            _comp_cfg
+                        )
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
@@ -11210,15 +11224,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # compression.hygiene_hard_message_limit.
                 # (#2153)
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
-                _needs_compress = (
+                _hard_threshold_need = (
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+                _topic_shift = TopicShiftDecision.AMBIGUOUS
+                if not _hard_threshold_need:
+                    _topic_shift = await classify_topic_shift(
+                        history,
+                        _topic_shift_incoming_text,
+                        _topic_shift_config,
+                        estimated_tokens=_approx_tokens,
+                        main_runtime=_hyg_runtime,
+                    )
+                _topic_shift_need = _topic_shift is TopicShiftDecision.SHIFT
+                _needs_compress = _hard_threshold_need or _topic_shift_need
 
                 if _needs_compress:
                     logger.info(
-                        "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
+                        "Session hygiene (%s): %s messages, ~%s tokens (%s) — auto-compressing "
                         "(threshold: %s%% of %s = %s tokens)",
+                        "hard-threshold" if _hard_threshold_need else "topic-shift",
                         _msg_count, f"{_approx_tokens:,}", _token_source,
                         int(_hyg_threshold_pct * 100),
                         f"{_hyg_context_length:,}",
