@@ -30,6 +30,10 @@ _CONTROL_PREFIXES = (
     "[prior context",
     "[system note:",
 )
+_APPENDED_CONTROL_PREFIXES = (
+    "background execution contract:",
+    "[completion guard active]",
+)
 
 
 class TopicShiftDecision(str, Enum):
@@ -108,8 +112,9 @@ async def classify_topic_shift(
     auxiliary_call: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> TopicShiftDecision:
     """Classify a candidate session, failing open unless the reply is exact SHIFT."""
+    cleaned_incoming_text = _clean_real_user_text(incoming_text)
     if not is_topic_shift_candidate(
-        history, incoming_text, config, estimated_tokens=estimated_tokens
+        history, cleaned_incoming_text, config, estimated_tokens=estimated_tokens
     ):
         return TopicShiftDecision.AMBIGUOUS
 
@@ -122,7 +127,7 @@ async def classify_topic_shift(
         {"role": "system", "content": _CLASSIFIER_INSTRUCTIONS},
         {
             "role": "user",
-            "content": _render_classifier_input(recent_turns, incoming_text),
+            "content": _render_classifier_input(recent_turns, cleaned_incoming_text),
         },
     ]
     try:
@@ -163,7 +168,14 @@ def _clean_real_user_text(content: Any) -> str:
     text = str(content or "").strip()
     if not text:
         return ""
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith(">")]
+    lines = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            continue
+        if stripped.lower().startswith(_APPENDED_CONTROL_PREFIXES):
+            break
+        lines.append(line)
     text = "\n".join(lines).strip()
     if text.lower().startswith(_CONTROL_PREFIXES):
         return ""

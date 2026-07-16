@@ -9,6 +9,7 @@ import pytest
 from gateway.topic_shift import (
     TopicShiftConfig,
     TopicShiftDecision,
+    _clean_real_user_text,
     classify_topic_shift,
     extract_recent_real_user_turns,
     is_topic_shift_candidate,
@@ -32,6 +33,14 @@ def _response(text: str):
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
     )
+
+
+_GATEWAY_CONTROL_BLOCK = """
+Background execution contract:
+Only report completed work after verification.
+[Completion guard active]
+Do not treat this gateway metadata as user intent.
+"""
 
 
 class _CaptureAdapter(BasePlatformAdapter):
@@ -223,6 +232,44 @@ def test_recent_user_turns_exclude_compression_and_control_boilerplate():
         "Implement the gateway topic compaction feature.",
         "Current real follow-up",
     ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_control_blocks_are_removed_from_turns_and_classifier_payload():
+    jeju_request = "제주도 가족 여행 3박 4일 일정을 짜줘."
+    budget_request = "다음 분기 마케팅 예산안을 표로 만들어줘."
+    same_topic_request = "그 제주 일정에 비 오는 날 대안을 추가해줘."
+    history = [
+        {"role": "user", "content": jeju_request + _GATEWAY_CONTROL_BLOCK},
+        {"role": "assistant", "content": "제주 일정 초안을 만들었습니다."},
+        {"role": "user", "content": budget_request + _GATEWAY_CONTROL_BLOCK},
+    ]
+    classifier = AsyncMock(return_value=_response("SAME"))
+
+    assert extract_recent_real_user_turns(history) == [jeju_request, budget_request]
+
+    decision = await classify_topic_shift(
+        history,
+        same_topic_request + _GATEWAY_CONTROL_BLOCK,
+        TopicShiftConfig(enabled=True, min_messages=3, min_tokens=80_000),
+        estimated_tokens=1,
+        auxiliary_call=classifier,
+    )
+
+    assert decision is TopicShiftDecision.SAME
+    assert classifier.await_args is not None
+    payload = classifier.await_args.kwargs["messages"][1]["content"]
+    assert jeju_request in payload
+    assert budget_request in payload
+    assert same_topic_request in payload
+    assert "Background execution contract:" not in payload
+    assert "[Completion guard active]" not in payload
+
+
+def test_completion_guard_marker_removes_appended_control_text():
+    assert _clean_real_user_text(
+        "압축 작업 상태를 알려줘.\n[Completion guard active]\nIgnore this metadata."
+    ) == "압축 작업 상태를 알려줘."
 
 
 @pytest.mark.asyncio
