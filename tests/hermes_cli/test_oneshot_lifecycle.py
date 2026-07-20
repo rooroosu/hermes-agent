@@ -347,7 +347,9 @@ def test_normal_completion_end_session_is_bounded_when_watchdog_present(patch_ag
     )
 
     watchdog, _writes, exits = _make_watchdog(deadline_s=60.0)
-    watchdog._db_write_budget_s = 0.1  # keep the test fast
+    # The NORMAL path uses _normal_finalize_budget_s (default 20s), NOT the
+    # watchdog's own 2s write budget — override it small to keep the test fast.
+    watchdog._normal_finalize_budget_s = 0.1
     watchdog.arm()
 
     t0 = time.monotonic()
@@ -358,6 +360,42 @@ def test_normal_completion_end_session_is_bounded_when_watchdog_present(patch_ag
     assert write_started.is_set()   # the terminal write WAS attempted
     assert elapsed < 2.0            # bounded — abandoned near budget, not sleep(10)
     assert exits == []              # normal path; watchdog never fired
+
+
+def test_normal_finalize_budget_exceeds_watchdog_and_completes_contended_write(patch_agent_stack, monkeypatch):
+    """Finding 3b/#3 (Codex): the normal path has the full ~60s external margin,
+    so its finalize budget must exceed the watchdog's tight 2s. A merely-CONTENDED
+    write (here 0.5s — longer than a 0.3s watchdog budget would tolerate) must
+    still COMPLETE and record end_reason, not be abandoned to NULL (which would
+    re-open the 3b failure mode by another route)."""
+    wrote = {}
+
+    class _SlowSessionDB:
+        def create_session(self, **kw):
+            pass
+
+        def end_session(self, sid, reason):
+            time.sleep(0.5)  # contention, but recoverable within the normal budget
+            wrote["reason"] = reason
+
+        def get_session(self, sid):
+            return {"end_reason": wrote.get("reason")}
+
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: _SlowSessionDB())
+    _set_run_conversation_impl(
+        monkeypatch, lambda agent, prompt: (agent._ensure_db_session(), "RESULT: DONE")[1]
+    )
+
+    watchdog, _writes, exits = _make_watchdog(deadline_s=60.0)
+    watchdog._db_write_budget_s = 0.3  # watchdog's tight budget would abandon a 0.5s write
+    # _normal_finalize_budget_s stays at its 20s default → the 0.5s write survives.
+    assert watchdog._normal_finalize_budget_s > watchdog._db_write_budget_s
+
+    watchdog.arm()
+    oneshot_mod._run_agent("say hi", watchdog=watchdog)
+
+    assert wrote.get("reason") == "oneshot_complete"  # write COMPLETED, not abandoned
+    assert exits == []
 
 
 # ── Finding 5c: exact stdout/stderr for the disabled (env-unset) path ──

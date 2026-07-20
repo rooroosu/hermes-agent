@@ -412,6 +412,19 @@ class _OneshotDeadlineWatchdog:
     #: actually watching for.
     _DEFAULT_DB_WRITE_BUDGET_S = 2.0
 
+    #: Budget for the NORMAL-completion terminal write (finalize_session_bounded),
+    #: distinct from fire_hard_deadline's 2s above. The watchdog fires AT the soft
+    #: deadline with no margin left, so it must abandon a stuck write in ~2s. The
+    #: normal path completes BEFORE the deadline and still has the dispatcher's full
+    #: post-deadline margin (~60s, SD_MARGIN in the *-verify/scan dispatch scripts)
+    #: before the external SIGKILL. Bounding it at 2s like the watchdog would abandon
+    #: a merely-CONTENDED write — SessionDB retries up to 15× (~1s busy-timeout +
+    #: 20-150ms jitter each ≈ 15-17s worst case) — that the old unbounded code would
+    #: have completed within margin, leaving end_reason NULL for no reason (re-opening
+    #: the 3b failure mode by another route). This budget covers that retry storm yet
+    #: stays far under the ~60s external margin, so a TRUE hang still exits gracefully.
+    _DEFAULT_NORMAL_FINALIZE_BUDGET_S = 20.0
+
     def __init__(
         self,
         *,
@@ -423,6 +436,7 @@ class _OneshotDeadlineWatchdog:
         timer_cls=threading.Timer,
         thread_cls=threading.Thread,
         db_write_budget_s: float = _DEFAULT_DB_WRITE_BUDGET_S,
+        normal_finalize_budget_s: float = _DEFAULT_NORMAL_FINALIZE_BUDGET_S,
     ) -> None:
         self._deadline_s = max(0.0, deadline_s)
         self._agent = agent
@@ -432,6 +446,7 @@ class _OneshotDeadlineWatchdog:
         self._timer_cls = timer_cls
         self._thread_cls = thread_cls
         self._db_write_budget_s = db_write_budget_s
+        self._normal_finalize_budget_s = normal_finalize_budget_s
 
         self._lock = threading.Lock()
         self._finalized = False
@@ -494,13 +509,16 @@ class _OneshotDeadlineWatchdog:
         # marker/DB-write work above finished.
         self._exit_committed.set()
 
-    def _attempt_bounded_end_session(self, session_db, sid, reason="oneshot_deadline") -> None:
+    def _attempt_bounded_end_session(self, session_db, sid, reason="oneshot_deadline",
+                                     budget_s=None) -> None:
         """Best-effort end_session(), capped so DB contention can never
         meaningfully delay process exit. A writer thread still stuck past
         the budget is simply abandoned — the process is exiting either way.
 
-        Shared by the watchdog's own deadline path (reason="oneshot_deadline")
-        and the NORMAL completion path via ``finalize_session_bounded``."""
+        Shared by the watchdog's own deadline path (reason="oneshot_deadline",
+        budget = _db_write_budget_s) and the NORMAL completion path via
+        ``finalize_session_bounded`` (a larger budget — see that method)."""
+        budget = self._db_write_budget_s if budget_s is None else budget_s
         done = threading.Event()
 
         def _write():
@@ -513,7 +531,7 @@ class _OneshotDeadlineWatchdog:
 
         writer = self._thread_cls(target=_write, daemon=True)
         writer.start()
-        done.wait(timeout=self._db_write_budget_s)
+        done.wait(timeout=budget)
 
     def cancel_and_claim(self) -> bool:
         """Called by the normal completion path.
@@ -542,8 +560,13 @@ class _OneshotDeadlineWatchdog:
         external dispatcher's SIGKILL, leaving ``end_reason`` NULL — the exact
         failure this watchdog exists to prevent. Cap the write with the same
         budget as the watchdog's own deadline write so a contended write is
-        abandoned in favour of a graceful, marker-clean exit."""
-        self._attempt_bounded_end_session(session_db, sid, reason)
+        abandoned in favour of a graceful, marker-clean exit. Uses the LARGER
+        normal-path budget (not the watchdog's tight 2s): the normal path
+        completes before the deadline and has the full ~60s external margin, so
+        it can afford to wait out SessionDB's retry storm rather than abandon a
+        merely-contended write (see _DEFAULT_NORMAL_FINALIZE_BUDGET_S)."""
+        self._attempt_bounded_end_session(
+            session_db, sid, reason, budget_s=self._normal_finalize_budget_s)
 
     def wait_for_exit(self, timeout: Optional[float] = None) -> None:
         """Block until ``fire_hard_deadline`` (running on the timer
