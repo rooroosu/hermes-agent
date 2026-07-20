@@ -494,15 +494,18 @@ class _OneshotDeadlineWatchdog:
         # marker/DB-write work above finished.
         self._exit_committed.set()
 
-    def _attempt_bounded_end_session(self, session_db, sid) -> None:
+    def _attempt_bounded_end_session(self, session_db, sid, reason="oneshot_deadline") -> None:
         """Best-effort end_session(), capped so DB contention can never
         meaningfully delay process exit. A writer thread still stuck past
-        the budget is simply abandoned — the process is exiting either way."""
+        the budget is simply abandoned — the process is exiting either way.
+
+        Shared by the watchdog's own deadline path (reason="oneshot_deadline")
+        and the NORMAL completion path via ``finalize_session_bounded``."""
         done = threading.Event()
 
         def _write():
             try:
-                session_db.end_session(sid, "oneshot_deadline")
+                session_db.end_session(sid, reason)
             except Exception:
                 logging.debug("oneshot watchdog: end_session failed", exc_info=True)
             finally:
@@ -529,6 +532,18 @@ class _OneshotDeadlineWatchdog:
         if self._hard_timer is not None:
             self._hard_timer.cancel()
         return True
+
+    def finalize_session_bounded(self, session_db, sid, reason) -> None:
+        """Bounded terminal write for the NORMAL completion path.
+
+        ``cancel_and_claim`` has already cancelled the hard timer, so a plain
+        ``end_session`` here would run with NO deadline backstop: a SQLite-lock
+        hang could push a normal completion past the soft deadline into the
+        external dispatcher's SIGKILL, leaving ``end_reason`` NULL — the exact
+        failure this watchdog exists to prevent. Cap the write with the same
+        budget as the watchdog's own deadline write so a contended write is
+        abandoned in favour of a graceful, marker-clean exit."""
+        self._attempt_bounded_end_session(session_db, sid, reason)
 
     def wait_for_exit(self, timeout: Optional[float] = None) -> None:
         """Block until ``fire_hard_deadline`` (running on the timer
@@ -715,6 +730,19 @@ def _run_agent(
             # oneshot_error (no exception was raised here; the model just
             # returned nothing).
             session_end_reason = "oneshot_empty"
+        elif not result.get("completed", False):
+            # Non-empty but the turn did NOT complete cleanly. run_conversation
+            # (via turn_finalizer.finalize_turn) sets completed=False for
+            # failed / interrupted / iteration-capped / output-truncated turns,
+            # and such results still return non-empty text while carrying a
+            # `failed`/`error` marker (e.g. "Invalid API response after N
+            # retries…"). Recording oneshot_complete for these would tell
+            # dispatcher-side incomplete-detection (qa_dispatch_store.
+            # retry_decision) the run was fine and suppress a valid retry. No
+            # exception was raised, so this is neither oneshot_error nor
+            # oneshot_empty — mark it incomplete (retryable; NOT the
+            # non-retryable oneshot_deadline contract).
+            session_end_reason = "oneshot_incomplete"
         return (response, result)
     except BaseException:
         session_end_reason = "oneshot_error"
@@ -728,10 +756,20 @@ def _run_agent(
         if finalize_owned:
             sid = getattr(agent, "session_id", None) if agent is not None else None
             if session_db is not None and sid:
-                try:
-                    session_db.end_session(sid, session_end_reason)
-                except Exception:
-                    logging.debug("oneshot: end_session failed", exc_info=True)
+                if watchdog is not None:
+                    # cancel_and_claim() cancelled the hard timer, so this
+                    # terminal write no longer has a deadline backstop. Bound it
+                    # (same budget as the watchdog's own write) so a SQLite-lock
+                    # hang can't push a normal completion past the soft deadline
+                    # into an external SIGKILL (→ end_reason NULL, the original
+                    # bug). With no soft deadline (watchdog is None) there is no
+                    # deadline to honour, so the plain write below is fine.
+                    watchdog.finalize_session_bounded(session_db, sid, session_end_reason)
+                else:
+                    try:
+                        session_db.end_session(sid, session_end_reason)
+                    except Exception:
+                        logging.debug("oneshot: end_session failed", exc_info=True)
         elif watchdog is not None:
             # We lost the race: the watchdog already committed to owning
             # the terminal outcome (RESULT marker written, end_session

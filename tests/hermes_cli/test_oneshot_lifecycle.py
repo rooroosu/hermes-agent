@@ -64,7 +64,12 @@ class _FakeAgent:
         outcome = self._run_conversation_impl(prompt)
         if isinstance(outcome, dict):
             return outcome
-        return {"final_response": outcome}
+        # A bare-string outcome models a NORMAL, cleanly-completed turn: real
+        # run_conversation() (turn_finalizer.finalize_turn) always sets
+        # ``completed`` on its result, and _run_agent now keys oneshot_complete
+        # off it. A non-empty string → completed True; an empty one → False
+        # (oneshot's own empty-response check fires first either way).
+        return {"final_response": outcome, "completed": bool((outcome or "").strip())}
 
 
 class _FakeTimer:
@@ -259,6 +264,100 @@ def test_run_oneshot_blank_response_exact_stderr_and_exit_code(patch_agent_stack
     sid = captured["agent"].session_id
     row = session_db.get_session(sid)
     assert row["end_reason"] == "oneshot_empty"
+
+
+# ── Finding 3a: a non-empty but NOT-cleanly-completed run must not be
+# tagged oneshot_complete. run_conversation() (turn_finalizer.finalize_turn)
+# always sets `completed`; failed/interrupted/iteration-capped/truncated turns
+# set completed=False while still returning non-empty text (e.g. "Invalid API
+# response after N retries…"). _run_agent used to key oneshot_complete purely
+# off "no exception + non-empty response", so those failed runs were recorded
+# complete — telling dispatcher-side incomplete-detection the opposite of the
+# truth and suppressing a valid retry. Fixed by gating on result["completed"].
+
+
+def test_nonempty_failed_run_is_tagged_oneshot_incomplete_not_complete(patch_agent_stack, monkeypatch):
+    session_db = patch_agent_stack
+
+    def _failed_nonempty(agent, prompt):
+        agent._ensure_db_session()
+        return {
+            "final_response": "Invalid API response after 3 retries: timeout",
+            "completed": False,
+            "failed": True,
+            "error": "Invalid API response after 3 retries: timeout",
+        }
+
+    captured = _set_run_conversation_impl(monkeypatch, _failed_nonempty)
+
+    response, result = oneshot_mod._run_agent("say hi")
+
+    assert response == "Invalid API response after 3 retries: timeout"
+    sid = captured["agent"].session_id
+    row = session_db.get_session(sid)
+    assert row["ended_at"] is not None
+    assert row["end_reason"] == "oneshot_incomplete"
+
+
+def test_nonempty_interrupted_run_is_not_tagged_complete(patch_agent_stack, monkeypatch):
+    """A non-empty but interrupted/partial turn (completed=False, no `failed`
+    flag) must also avoid oneshot_complete — the gate is on `completed`, not
+    only on an affirmative failure marker."""
+    session_db = patch_agent_stack
+
+    captured = _set_run_conversation_impl(
+        monkeypatch,
+        lambda agent, prompt: (agent._ensure_db_session(), {
+            "final_response": "partial work so far…",
+            "completed": False,
+            "interrupted": True,
+        })[1],
+    )
+
+    oneshot_mod._run_agent("say hi")
+
+    row = session_db.get_session(captured["agent"].session_id)
+    assert row["end_reason"] == "oneshot_incomplete"
+
+
+# ── Finding 3b: the NORMAL completion path's terminal end_session() write
+# must be bounded. cancel_and_claim() cancels the hard timer, so an unbounded
+# write there has no deadline backstop — a SQLite-lock hang could push a normal
+# completion past the soft deadline into the external dispatcher's SIGKILL,
+# leaving end_reason NULL (the exact bug the watchdog exists to prevent).
+
+
+def test_normal_completion_end_session_is_bounded_when_watchdog_present(patch_agent_stack, monkeypatch):
+    write_started = threading.Event()
+
+    class _StuckSessionDB:
+        def create_session(self, **kw):
+            pass
+
+        def end_session(self, sid, reason):
+            write_started.set()
+            time.sleep(10)  # far longer than the budget
+
+        def get_session(self, sid):
+            return None
+
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: _StuckSessionDB())
+    _set_run_conversation_impl(
+        monkeypatch, lambda agent, prompt: (agent._ensure_db_session(), "RESULT: DONE")[1]
+    )
+
+    watchdog, _writes, exits = _make_watchdog(deadline_s=60.0)
+    watchdog._db_write_budget_s = 0.1  # keep the test fast
+    watchdog.arm()
+
+    t0 = time.monotonic()
+    response, result = oneshot_mod._run_agent("say hi", watchdog=watchdog)
+    elapsed = time.monotonic() - t0
+
+    assert response == "RESULT: DONE"
+    assert write_started.is_set()   # the terminal write WAS attempted
+    assert elapsed < 2.0            # bounded — abandoned near budget, not sleep(10)
+    assert exits == []              # normal path; watchdog never fired
 
 
 # ── Finding 5c: exact stdout/stderr for the disabled (env-unset) path ──
