@@ -159,3 +159,80 @@ class TestCombinedGuards:
             error = get_read_block_error(str(cache))
             assert error is not None
             assert "internal Hermes cache" in error
+
+
+# ---------------------------------------------------------------------------
+# Write-denial reason classification (workspace confinement vs protected)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteDenialReason:
+    def test_outside_safe_root_classified(self, tmp_path, monkeypatch):
+        from agent.file_safety import write_denial_error, write_denial_reason
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(workspace))
+
+        assert write_denial_reason(str(tmp_path / "outside.txt")) == "outside_safe_root"
+        assert write_denial_reason(str(workspace / "inside.txt")) is None
+        error = write_denial_error(str(tmp_path / "outside.txt"))
+        assert "workspace confinement" in error
+        assert "credential" not in error.split("not a")[0]
+
+    def test_protected_beats_confinement(self, tmp_path, monkeypatch):
+        from agent.file_safety import write_denial_reason
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        assert write_denial_reason(os.path.expanduser("~/.ssh/id_rsa")) == "protected"
+
+    def test_no_env_mutation_and_thread_safety(self, tmp_path, monkeypatch):
+        """Regression: classification must never clear HERMES_WRITE_SAFE_ROOT
+        for other threads (a concurrent is_write_denied could allow a
+        forbidden write)."""
+        import threading
+
+        from agent.file_safety import is_write_denied, write_denial_reason
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(workspace))
+        outside = str(tmp_path / "forbidden.txt")
+
+        violations = []
+        stop = threading.Event()
+
+        def hammer_check():
+            while not stop.is_set():
+                if not is_write_denied(outside):
+                    violations.append("allowed")
+                    return
+
+        checker = threading.Thread(target=hammer_check)
+        checker.start()
+        try:
+            for _ in range(500):
+                assert write_denial_reason(outside) == "outside_safe_root"
+                assert os.environ["HERMES_WRITE_SAFE_ROOT"] == str(workspace)
+        finally:
+            stop.set()
+            checker.join()
+        assert not violations
+
+    def test_multiple_safe_roots_pathsep_separated(self, tmp_path, monkeypatch):
+        """0.18.2-specific: HERMES_WRITE_SAFE_ROOT supports os.pathsep-joined
+        multiple roots (get_safe_write_roots() returns a set) — a path
+        inside ANY listed root must be allowed, not just the first one."""
+        from agent.file_safety import write_denial_reason
+
+        root_a = tmp_path / "root_a"
+        root_b = tmp_path / "root_b"
+        root_a.mkdir()
+        root_b.mkdir()
+        monkeypatch.setenv(
+            "HERMES_WRITE_SAFE_ROOT", os.pathsep.join([str(root_a), str(root_b)])
+        )
+
+        assert write_denial_reason(str(root_a / "a.txt")) is None
+        assert write_denial_reason(str(root_b / "b.txt")) is None
+        assert write_denial_reason(str(tmp_path / "outside.txt")) == "outside_safe_root"

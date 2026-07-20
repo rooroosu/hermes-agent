@@ -97,6 +97,26 @@ def get_safe_write_roots() -> set[str]:
 
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
+    if _is_protected_write_path(path):
+        return True
+
+    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    safe_roots = get_safe_write_roots()
+    if safe_roots and not _within_any_safe_root(resolved, safe_roots):
+        return True
+
+    return False
+
+
+def _within_any_safe_root(resolved: str, safe_roots: set[str]) -> bool:
+    return any(
+        resolved == safe_root or resolved.startswith(safe_root + os.sep)
+        for safe_root in safe_roots
+    )
+
+
+def _is_protected_write_path(path: str) -> bool:
+    """Denylist/control-plane checks only — ignores HERMES_WRITE_SAFE_ROOT."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
@@ -131,17 +151,45 @@ def is_write_denied(path: str) -> bool:
         except Exception:
             pass
 
+    return False
+
+
+def write_denial_reason(path: str) -> Optional[str]:
+    """Classify why a write would be denied, or None if allowed.
+
+    Returns "protected" for denylist/control-plane/credential paths and
+    "outside_safe_root" for workspace-confinement denials, so callers can
+    emit an accurate error instead of labelling every denial a
+    credential-file block. Pure read — never mutates process state.
+    """
+    if _is_protected_write_path(path):
+        return "protected"
     safe_roots = get_safe_write_roots()
     if safe_roots:
-        allowed = False
-        for safe_root in safe_roots:
-            if resolved == safe_root or resolved.startswith(safe_root + os.sep):
-                allowed = True
-                break
-        if not allowed:
-            return True
+        try:
+            resolved = os.path.realpath(os.path.expanduser(str(path)))
+        except Exception:
+            return "protected"
+        if not _within_any_safe_root(resolved, safe_roots):
+            return "outside_safe_root"
+    return None
 
-    return False
+
+def write_denial_error(path: str) -> Optional[str]:
+    """Human-readable denial message for a path, or None if allowed."""
+    reason = write_denial_reason(path)
+    if reason is None:
+        return None
+    if reason == "outside_safe_root":
+        # Show the raw env value (may list multiple os.pathsep-separated
+        # roots) rather than picking one resolved root out of the set.
+        root_env = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
+        return (
+            f"Write denied: '{path}' is outside the configured write workspace "
+            f"(HERMES_WRITE_SAFE_ROOT={root_env}). This is workspace confinement, not a "
+            f"credential block — write inside the workspace or report the path instead."
+        )
+    return f"Write denied: '{path}' is a protected system/credential file."
 
 
 # Common secret-bearing project-local environment file basenames.
