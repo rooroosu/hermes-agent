@@ -267,6 +267,62 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
+@pytest.mark.parametrize(
+    "exit_reason",
+    [
+        "empty_response_exhausted",
+        "error_near_max_iterations(boom)",
+    ],
+)
+def test_failure_terminal_below_iteration_limit_is_not_completed(monkeypatch, exit_reason):
+    """#2: the sentinel final_response ("(empty)" / apology string) that these
+    terminals set must NOT count as a completion even when api_call_count is well
+    below max_iterations. The old ``final_response is not None and api_call_count
+    < max`` computation reported completed=True here; oneshot then labeled it
+    oneshot_complete instead of the retryable oneshot_incomplete. api_call_count=3
+    (far below the 60 limit) is the case the plain guard could not catch."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=5)
+
+    result = _finalize(
+        agent,
+        final_response="(empty)",
+        exit_reason=exit_reason,
+        api_call_count=3,
+    )
+
+    assert result["completed"] is False
+    assert result["turn_exit_reason"] == exit_reason
+    assert agent._handle_max_iterations_called is False
+
+
+@pytest.mark.parametrize(
+    "exit_reason",
+    [
+        "partial_stream_recovery",
+        "fallback_prior_turn_content",
+        "text_response(finish_reason=stop)",
+    ],
+)
+def test_degraded_but_real_content_below_limit_stays_completed(monkeypatch, exit_reason):
+    """Anti-overscope guard for #2: recovered/fallback/normal terminals carry a
+    REAL final_response and must stay completed=True below the iteration limit.
+    Only empty_response_exhausted + error_near_max_iterations are failure
+    sentinels; these three must not be swept into the not-completed set."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=5)
+
+    result = _finalize(
+        agent,
+        final_response="real recovered content",
+        exit_reason=exit_reason,
+        api_call_count=3,
+    )
+
+    assert result["completed"] is True
+    assert result["turn_exit_reason"] == exit_reason
+
+
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")

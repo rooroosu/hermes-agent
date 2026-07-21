@@ -27,6 +27,31 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+# ── Abnormal terminal exit reasons ──────────────────────────────────────────
+# These set a *sentinel* ``final_response`` (an apology string, or the literal
+# "(empty)") purely to keep the transcript syntactically valid, but the turn did
+# NOT complete successfully. The generic ``completed`` computation below trusts
+# ``final_response is not None`` as a success proxy and only excludes turns that
+# reached ``max_iterations``; without this set, an ``empty_response_exhausted``
+# terminal (final_response == "(empty)") or a near-limit
+# ``error_near_max_iterations`` terminal (fires at api_call_count ==
+# max_iterations - 1, which still satisfies ``< max_iterations``) is
+# mis-reported as completed=True. Consumers depend on completed=False here:
+# oneshot end_reason labeling (→ ``oneshot_incomplete``, retryable) and the
+# gateway resume-marker retention gate. Matched by prefix because
+# ``error_near_max_iterations`` carries a dynamic ``(...)`` suffix.
+_FAILURE_EXIT_REASON_PREFIXES = (
+    "empty_response_exhausted",
+    "error_near_max_iterations",
+)
+
+
+def _is_failure_exit_reason(reason) -> bool:
+    """True iff the turn ended on an abnormal terminal that set a sentinel
+    ``final_response`` — i.e. it must never count as a successful completion."""
+    return str(reason).startswith(_FAILURE_EXIT_REASON_PREFIXES)
+
+
 def finalize_turn(
     agent,
     *,
@@ -150,6 +175,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not _is_failure_exit_reason(_turn_exit_reason)
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
