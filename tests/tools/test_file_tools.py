@@ -65,6 +65,57 @@ class TestReadFileHandler:
         assert "terminal not available" in result["error"]
 
 
+class TestSearchFilesPrivacyBoundary:
+    @patch("tools.file_tools._terminal_env_type_for_task", return_value="local")
+    @patch("tools.file_tools._get_file_ops")
+    def test_blocks_whole_home_search_before_subprocess(self, mock_get, _mock_env, monkeypatch, tmp_path):
+        from tools import file_tools
+
+        monkeypatch.setattr(file_tools, "_expand_tilde", lambda value: str(tmp_path) if value == "~" else value)
+        result = json.loads(file_tools.search_tool("*.py", target="files", path=str(tmp_path)))
+
+        assert "error" in result
+        assert "broad recursive search" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._terminal_env_type_for_task", return_value="local")
+    @patch("tools.file_tools._get_file_ops")
+    def test_allows_specific_project_search(self, mock_get, _mock_env, monkeypatch, tmp_path):
+        from tools import file_tools
+
+        project = tmp_path / "Workspace" / "project"
+        project.mkdir(parents=True)
+        monkeypatch.setattr(file_tools, "_expand_tilde", lambda value: str(tmp_path) if value == "~" else value)
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.matches = []
+        result_obj.to_dict.return_value = {"total_count": 0}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        result = json.loads(file_tools.search_tool("*.py", target="files", path=str(project)))
+
+        assert result == {"total_count": 0}
+        mock_ops.search.assert_called_once()
+
+    @patch("tools.file_tools._terminal_env_type_for_task", return_value="docker")
+    @patch("tools.file_tools._get_file_ops")
+    def test_does_not_apply_host_privacy_boundary_to_container_root(self, mock_get, _mock_env):
+        from tools import file_tools
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.matches = []
+        result_obj.to_dict.return_value = {"total_count": 0}
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        result = json.loads(file_tools.search_tool("*.py", target="files", path="/"))
+
+        assert result == {"total_count": 0}
+        mock_ops.search.assert_called_once()
+
+
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
     def test_writes_content(self, mock_get):

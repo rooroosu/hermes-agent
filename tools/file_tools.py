@@ -1987,6 +1987,34 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+
+        # On a local macOS backend, a recursive search rooted at the user's
+        # entire home directory (or at filesystem root) can descend into
+        # Photos, Music/MediaLibrary, iCloud, and other TCC-protected trees.
+        # macOS attributes the resulting permission prompt to Hermes even when
+        # the actual accessor is the rg/find subprocess. This is never a
+        # sensible default discovery scope: callers should search a known
+        # project, skill, or script root instead. Enforce that boundary here so
+        # every profile gets the protection even if its prompt/skill copy is
+        # stale. Explicit searches *inside* Pictures/Music remain possible for
+        # user-requested media tasks; only the dangerously broad roots block.
+        if resolved_path is not None and _terminal_env_type_for_task(task_id) == "local":
+            try:
+                candidate = Path(str(resolved_path)).resolve()
+                home = Path(_expand_tilde("~")).resolve()
+                blocked_roots = {Path("/").resolve(), home, home.parent}
+                if candidate in blocked_roots:
+                    return json.dumps({
+                        "error": (
+                            "BLOCKED: broad recursive search at filesystem root, the users "
+                            "directory, or the whole home directory is disabled on local "
+                            "macOS because it can traverse Photos, Music, iCloud, and other "
+                            "privacy-protected libraries. Search a specific project, skill, "
+                            "script, or explicitly requested media directory instead."
+                        )
+                    }, ensure_ascii=False)
+            except (OSError, RuntimeError, ValueError):
+                pass
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
