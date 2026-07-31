@@ -2866,7 +2866,13 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
-        verified_bot_thread_reply = False
+        # A remembered root is known bot output (or was verified and remembered
+        # by this process). It receives the same reaction lifecycle as the
+        # initial live-verified reply, including when ordinary mention gating
+        # is otherwise bypassed for a configured free-response channel.
+        verified_bot_thread_reply = bool(
+            is_thread_reply and event_thread_ts in self._bot_message_ts
+        )
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
@@ -2883,9 +2889,7 @@ class SlackAdapter(BasePlatformAdapter):
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
+                reply_to_bot_thread = verified_bot_thread_reply
                 in_mentioned_thread = (
                     event_thread_ts is not None
                     and event_thread_ts in self._mentioned_threads

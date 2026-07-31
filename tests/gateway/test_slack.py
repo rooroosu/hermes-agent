@@ -20,6 +20,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SUPPORTED_VIDEO_TYPES,
     is_host_excluded_by_no_proxy,
 )
@@ -95,6 +96,7 @@ class TestRestartSafeBotThreadReplies:
         adapter._reacting_message_ids = set()
         adapter.config.extra["allowed_channels"] = ["C_CHANNEL"]
         adapter._reactions_enabled = MagicMock(return_value=True)
+        adapter._resolve_user_name = AsyncMock(return_value="human")
         adapter._app.client.conversations_replies = AsyncMock(return_value={"messages": [
             root,
             {"ts": "1710000001.000001", "user": "U_HUMAN", "text": "follow up"},
@@ -183,10 +185,28 @@ class TestRestartSafeBotThreadReplies:
         await adapter._handle_slack_message(self._event(ts="1710000002.000001"))
 
         assert adapter.handle_message.await_count == 2
+        second_event = adapter.handle_message.await_args.args[0]
+        assert second_event.message_id == "1710000002.000001"
+        assert second_event.message_id in adapter._reacting_message_ids
         assert len([
             call for call in adapter._app.client.conversations_replies.await_args_list
             if call.kwargs.get("limit") == 1
         ]) == ownership_calls_after_first_reply
+
+        await adapter.on_processing_start(second_event)
+        await adapter.on_processing_complete(second_event, ProcessingOutcome.SUCCESS)
+
+        adapter._app.client.reactions_add.assert_has_awaits([
+            call(channel="C_CHANNEL", timestamp="1710000002.000001", name="eyes"),
+            call(
+                channel="C_CHANNEL",
+                timestamp="1710000002.000001",
+                name="white_check_mark",
+            ),
+        ])
+        adapter._app.client.reactions_remove.assert_awaited_once_with(
+            channel="C_CHANNEL", timestamp="1710000002.000001", name="eyes"
+        )
 
 
 async def _pending_for_fake_task():
