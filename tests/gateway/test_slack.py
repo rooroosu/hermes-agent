@@ -71,6 +71,124 @@ _slack_mod.SLACK_AVAILABLE = True
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 
 
+class TestRestartSafeBotThreadReplies:
+    """Unmentioned channel replies need a verified Hermes-owned thread root."""
+
+    ROOT_TS = "1710000000.000001"
+
+    def _event(self, ts="1710000001.000001"):
+        return {
+            "text": "follow up",
+            "user": "U_HUMAN",
+            "channel": "C_CHANNEL",
+            "channel_type": "channel",
+            "team": "T_WORKSPACE",
+            "ts": ts,
+            "thread_ts": self.ROOT_TS,
+        }
+
+    def _configure(self, adapter, root):
+        adapter._team_bot_user_ids = {"T_WORKSPACE": "U_WORKSPACE_BOT"}
+        adapter._channel_team = {}
+        adapter._bot_message_ts = set()
+        adapter._mentioned_threads = set()
+        adapter._reacting_message_ids = set()
+        adapter.config.extra["allowed_channels"] = ["C_CHANNEL"]
+        adapter._reactions_enabled = MagicMock(return_value=True)
+        adapter._app.client.conversations_replies = AsyncMock(return_value={"messages": [
+            root,
+            {"ts": "1710000001.000001", "user": "U_HUMAN", "text": "follow up"},
+        ]})
+
+    @pytest.mark.asyncio
+    async def test_verified_workspace_bot_root_accepts_unmentioned_reply_and_reacts(self, adapter):
+        self._configure(
+            adapter,
+            {"ts": self.ROOT_TS, "user": "U_WORKSPACE_BOT", "text": "cron result"},
+        )
+
+        await adapter._handle_slack_message(self._event())
+
+        adapter.handle_message.assert_awaited_once()
+        assert self.ROOT_TS in adapter._bot_message_ts
+        assert "1710000001.000001" in adapter._reacting_message_ids
+        ownership_calls = [
+            call for call in adapter._app.client.conversations_replies.await_args_list
+            if call.kwargs.get("limit") == 1
+        ]
+        assert ownership_calls == [call(
+            channel="C_CHANNEL", ts=self.ROOT_TS, limit=1, inclusive=True
+        )]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("root", [
+        {"ts": ROOT_TS, "user": "U_HUMAN", "bot_id": "B_OTHER"},
+        {"ts": ROOT_TS, "user": "U_OTHER_BOT", "bot_id": "B_OTHER"},
+        {"ts": ROOT_TS, "bot_id": "B_WORKSPACE"},
+    ])
+    async def test_human_other_bot_or_missing_user_root_is_ignored(self, adapter, root):
+        self._configure(adapter, root)
+
+        await adapter._handle_slack_message(self._event())
+
+        adapter.handle_message.assert_not_awaited()
+        assert self.ROOT_TS not in adapter._bot_message_ts
+        assert not adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_root_ownership_api_failure_fails_closed(self, adapter):
+        self._configure(adapter, {"ts": self.ROOT_TS, "user": "U_WORKSPACE_BOT"})
+        adapter._app.client.conversations_replies.side_effect = RuntimeError("Slack unavailable")
+
+        await adapter._handle_slack_message(self._event())
+
+        adapter.handle_message.assert_not_awaited()
+        assert self.ROOT_TS not in adapter._bot_message_ts
+        assert not adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_empty_root_ownership_response_fails_closed(self, adapter):
+        self._configure(adapter, {"ts": self.ROOT_TS, "user": "U_WORKSPACE_BOT"})
+        adapter._app.client.conversations_replies.return_value = {"messages": []}
+
+        await adapter._handle_slack_message(self._event())
+
+        adapter.handle_message.assert_not_awaited()
+        assert self.ROOT_TS not in adapter._bot_message_ts
+        assert not adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_strict_mention_does_not_call_root_fallback(self, adapter):
+        adapter.config.extra["strict_mention"] = True
+        self._configure(adapter, {"ts": self.ROOT_TS, "user": "U_WORKSPACE_BOT"})
+
+        await adapter._handle_slack_message(self._event())
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._app.client.conversations_replies.assert_not_awaited()
+        assert not adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_cached_verified_root_avoids_another_ownership_lookup(self, adapter):
+        self._configure(
+            adapter,
+            {"ts": self.ROOT_TS, "user": "U_WORKSPACE_BOT", "text": "cron result"},
+        )
+
+        await adapter._handle_slack_message(self._event())
+        ownership_calls_after_first_reply = len([
+            call for call in adapter._app.client.conversations_replies.await_args_list
+            if call.kwargs.get("limit") == 1
+        ])
+        await adapter._handle_slack_message(self._event(ts="1710000002.000001"))
+
+        assert adapter.handle_message.await_count == 2
+        assert len([
+            call for call in adapter._app.client.conversations_replies.await_args_list
+            if call.kwargs.get("limit") == 1
+        ]) == ownership_calls_after_first_reply
+
+
 async def _pending_for_fake_task():
     # Stay pending so done-callbacks attached by the adapter (which would
     # otherwise schedule a reconnect) don't fire during the test. The pytest

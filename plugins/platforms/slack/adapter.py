@@ -1417,14 +1417,10 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
-                self._bot_message_ts.add(sent_ts)
+                self._remember_bot_message_ts(sent_ts)
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
-                    self._bot_message_ts.add(thread_ts)
-                if len(self._bot_message_ts) > self._BOT_TS_MAX:
-                    excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
-                    for old_ts in list(self._bot_message_ts)[:excess]:
-                        self._bot_message_ts.discard(old_ts)
+                    self._remember_bot_message_ts(thread_ts)
 
             return SendResult(
                 success=True,
@@ -1837,11 +1833,49 @@ class SlackAdapter(BasePlatformAdapter):
         """Treat successful file uploads as bot participation in a thread."""
         if not thread_ts:
             return
-        self._bot_message_ts.add(thread_ts)
+        self._remember_bot_message_ts(thread_ts)
+
+    def _remember_bot_message_ts(self, message_ts: str) -> None:
+        """Remember a bot message/thread root while preserving the cache cap."""
+        self._bot_message_ts.add(message_ts)
         if len(self._bot_message_ts) > self._BOT_TS_MAX:
             excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
             for old_ts in list(self._bot_message_ts)[:excess]:
                 self._bot_message_ts.discard(old_ts)
+
+    async def _verify_bot_owned_thread_root(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        team_id: str,
+    ) -> bool:
+        """Fail closed unless the thread root belongs to this workspace's bot.
+
+        This restart-safe fallback is deliberately narrower than normal thread
+        context fetching: one root-only request, exact ``user`` identity match,
+        and no inference from a generic Slack ``bot_id`` or subtype.
+        """
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        if not bot_uid:
+            return False
+        try:
+            result = await self._get_client(channel_id).conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=1,
+                inclusive=True,
+            )
+            messages = result.get("messages", []) if result else []
+            if not isinstance(messages, list) or not messages:
+                return False
+            root = messages[0]
+            return root.get("ts") == thread_ts and root.get("user") == bot_uid
+        except Exception:
+            logger.debug(
+                "[Slack] Could not verify bot ownership for thread root %s", thread_ts,
+                exc_info=True,
+            )
+            return False
 
     def _is_retryable_upload_error(self, exc: Exception) -> bool:
         """Best-effort detection for transient Slack upload failures."""
@@ -2832,6 +2866,7 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
+        verified_bot_thread_reply = False
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
@@ -2865,7 +2900,15 @@ class SlackAdapter(BasePlatformAdapter):
                     and not in_mentioned_thread
                     and not has_session
                 ):
-                    return
+                    thread_root_ts = str(event_thread_ts) if is_thread_reply else ""
+                    verified_bot_thread_reply = bool(thread_root_ts) and await self._verify_bot_owned_thread_root(
+                        channel_id=channel_id,
+                        thread_ts=thread_root_ts,
+                        team_id=team_id,
+                    )
+                    if not verified_bot_thread_reply:
+                        return
+                    self._remember_bot_message_ts(thread_root_ts)
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -3225,11 +3268,14 @@ class SlackAdapter(BasePlatformAdapter):
             auto_skill=_auto_skill,
         )
 
-        # Only react when bot is directly addressed (1:1 DM or @mention).
+        # Only react when bot is directly addressed (1:1 DM or @mention), or
+        # when the bounded fallback verified this is a reply to our own root.
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
         # be @mentioned to earn a reaction — same as any channel.
-        _should_react = (is_one_to_one_dm or is_mentioned) and self._reactions_enabled()
+        _should_react = (
+            is_one_to_one_dm or is_mentioned or verified_bot_thread_reply
+        ) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(ts)
 
