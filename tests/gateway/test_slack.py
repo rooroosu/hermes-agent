@@ -10,6 +10,7 @@ We mock the slack modules at import time to avoid collection errors.
 
 import asyncio
 import contextlib
+import logging
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch, call
@@ -566,6 +567,150 @@ class TestSlackSocketWatchdog:
     async def _drain(self, iterations=10):
         for _ in range(iterations):
             await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_and_awaits_socket_task_before_closing_handler(self):
+        """Never close the SDK session while start_async is still retrying."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        events = []
+
+        class RacingHandler:
+            async def start_async(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    events.append("start-cancelled")
+                    raise
+
+            async def close_async(self):
+                events.append("handler-closed")
+
+        handler = RacingHandler()
+        adapter._handler = handler
+        adapter._socket_mode_task = asyncio.create_task(handler.start_async())
+        await self._drain()
+
+        await adapter._stop_socket_mode_handler()
+
+        assert events == ["start-cancelled", "handler-closed"]
+        assert adapter._handler is None
+        assert adapter._socket_mode_task is None
+
+    @pytest.mark.asyncio
+    async def test_stuck_handler_close_does_not_block_reconnect_or_leave_duplicate_handler(self):
+        """A bounded old close permits exactly one fresh Socket Mode handler."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        adapter._app = MagicMock()
+        adapter._app_token = "xapp-fake"
+        adapter._socket_handler_close_timeout_s = 0.01
+        close_started = asyncio.Event()
+        close_release = asyncio.Event()
+        created = []
+
+        class StuckHandler:
+            client = MagicMock()
+
+            async def start_async(self):
+                await asyncio.Event().wait()
+
+            async def close_async(self):
+                close_started.set()
+                await close_release.wait()
+
+        class FreshHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.client = MagicMock()
+                created.append(self)
+
+            async def start_async(self):
+                await asyncio.Event().wait()
+
+            async def close_async(self):
+                pass
+
+        old_handler = StuckHandler()
+        old_task = asyncio.create_task(old_handler.start_async())
+        adapter._handler = old_handler
+        adapter._socket_mode_task = old_task
+        await self._drain()
+
+        with patch.object(_slack_mod, "AsyncSocketModeHandler", FreshHandler):
+            await adapter._restart_socket_mode("test stuck close")
+
+        assert close_started.is_set()
+        assert old_task.cancelled()
+        assert len(created) == 1
+        assert adapter._handler is created[0]
+        assert adapter._socket_mode_task is not old_task
+
+        close_release.set()
+        await self._drain()
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_timed_out_handler_close_exception_is_reaped_before_reconnect(self, caplog):
+        """A close failure during cancellation is logged and never escapes its task."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._running = True
+        adapter._app = MagicMock()
+        adapter._app_token = "xapp-fake"
+        adapter._socket_handler_close_timeout_s = 0.01
+        created = []
+        unhandled = []
+        loop = asyncio.get_running_loop()
+        previous_exception_handler = loop.get_exception_handler()
+
+        class FailingCloseHandler:
+            client = MagicMock()
+
+            async def start_async(self):
+                await asyncio.Event().wait()
+
+            async def close_async(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise RuntimeError("close failed during cancellation")
+
+        class FreshHandler:
+            def __init__(self, app, app_token, proxy=None):
+                self.client = MagicMock()
+                created.append(self)
+
+            async def start_async(self):
+                await asyncio.Event().wait()
+
+            async def close_async(self):
+                pass
+
+        old_handler = FailingCloseHandler()
+        old_task = asyncio.create_task(old_handler.start_async())
+        adapter._handler = old_handler
+        adapter._socket_mode_task = old_task
+        await self._drain()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger=_slack_mod.logger.name),
+                patch.object(_slack_mod, "AsyncSocketModeHandler", FreshHandler),
+            ):
+                await adapter._restart_socket_mode("test close cancellation failure")
+                await self._drain()
+
+            assert old_task.cancelled()
+            assert len(created) == 1
+            assert adapter._handler is created[0]
+            assert not adapter._socket_handler_close_tasks
+            assert unhandled == []
+            assert sum(
+                "Socket Mode handler close failed after timeout" in record.message
+                for record in caplog.records
+            ) == 1
+        finally:
+            loop.set_exception_handler(previous_exception_handler)
+            await adapter.disconnect()
 
     @pytest.mark.asyncio
     async def test_watchdog_reconnects_when_socket_task_dies_unexpectedly(self):

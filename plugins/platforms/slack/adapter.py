@@ -486,6 +486,11 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        self._socket_handler_close_tasks: set[asyncio.Task] = set()
+        # SDK shutdown is best effort. A stuck close must not hold the
+        # watchdog's reconnect lock forever after the running socket task has
+        # already been stopped.
+        self._socket_handler_close_timeout_s = 10.0
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -508,16 +513,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._handler = None
         self._socket_mode_task = None
 
-        if handler is not None:
-            try:
-                await handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.warning(
-                    "[Slack] Error while closing Socket Mode handler: %s",
-                    e,
-                    exc_info=True,
-                )
-
+        # ``close_async`` closes the SDK's aiohttp session. The running
+        # ``start_async`` task can still be in the SDK's reconnect loop, so it
+        # must be cancelled and reaped before that session is closed. Closing
+        # first leaves the retry loop alive against a closed session.
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -528,6 +527,51 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[Slack] Socket Mode task failed while stopping", exc_info=True
                 )
+
+        if handler is not None:
+            close_task = asyncio.get_running_loop().create_task(handler.close_async())
+            try:
+                # Shield the close task so the timeout is a real bound even if
+                # the SDK delays responding to cancellation. The task is then
+                # cancelled below and deliberately not awaited: reconnect can
+                # safely continue because the socket task is already stopped.
+                await asyncio.wait_for(
+                    asyncio.shield(close_task),
+                    timeout=self._socket_handler_close_timeout_s,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "[Slack] Socket Mode handler close timed out after %.1fs; "
+                    "continuing reconnect",
+                    self._socket_handler_close_timeout_s,
+                )
+                # A close coroutine can raise while handling cancellation. Keep
+                # ownership until its done callback consumes that result so it
+                # cannot become an unhandled task exception.
+                self._socket_handler_close_tasks.add(close_task)
+                close_task.add_done_callback(self._reap_socket_handler_close_task)
+                close_task.cancel()
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "[Slack] Error while closing Socket Mode handler: %s",
+                    e,
+                    exc_info=True,
+                )
+
+    def _reap_socket_handler_close_task(self, task: asyncio.Task) -> None:
+        """Consume a timed-out close task once it eventually finishes."""
+        self._socket_handler_close_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - defensive logging
+            logger.warning(
+                "[Slack] Socket Mode handler close failed after timeout",
+                exc_info=True,
+            )
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
