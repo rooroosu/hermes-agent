@@ -12,7 +12,7 @@ from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
 from hermes_cli import slack_cli
 from plugins.platforms.slack import adapter as slack_adapter_module
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config
 
 
 def _config(store, *, profile="nami"):
@@ -70,6 +70,28 @@ def test_profile_invocations_fail_closed_without_multiplex(tmp_path):
     with patch("agent.secret_scope.is_multiplex_active", return_value=False):
         assert adapter._profile_invocation_specs() == {}
         assert adapter._match_profile_alias("나미 재고 확인")[0] is None
+
+
+def test_yaml_bridge_preserves_structured_profile_invocations():
+    invocations = [
+        {
+            "profile": "nami",
+            "aliases": ["nami", "나미"],
+            "display_name": "Nami",
+            "icon_emoji": ":hermes_nami:",
+        }
+    ]
+
+    assert _apply_yaml_config(
+        {},
+        {
+            "profile_invocations": invocations,
+            "profile_invocation_store": "/tmp/routes.json",
+        },
+    ) == {
+        "profile_invocations": invocations,
+        "profile_invocation_store": "/tmp/routes.json",
+    }
 
 
 @pytest.mark.asyncio

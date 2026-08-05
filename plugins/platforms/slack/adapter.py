@@ -9281,14 +9281,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     legacy ``slack_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    Most SlackAdapter settings are env-driven. Profile invocation metadata is
+    intentionally different: it is structured, non-secret configuration read
+    from ``PlatformConfig.extra`` at dispatch time. Preserve those keys when
+    the Slack block lives under ``gateway.platforms.slack`` so live YAML loads
+    match adapters constructed directly in tests.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -9340,7 +9337,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+    extras = {}
+    for key in ("profile_invocations", "profile_invocation_store"):
+        if key in slack_cfg:
+            extras[key] = slack_cfg[key]
+    return extras or None
 
 
 def _is_connected(config) -> bool:
