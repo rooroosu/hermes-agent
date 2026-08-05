@@ -269,6 +269,8 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _profile_persona: contextvars.ContextVar[Optional[Dict[str, str]]] = (
     contextvars.ContextVar("_profile_persona", default=None)
 )
+_PROFILE_PERSONA_METADATA_KEY = "_slack_profile_persona"
+_SLASH_USER_ID_METADATA_KEY = "_slack_slash_user_id"
 
 
 @dataclass
@@ -2642,6 +2644,31 @@ class SlackAdapter(BasePlatformAdapter):
         parent_channel_id = str(channel_id).split(":", 1)[0]
         ignored = self._slack_ignored_channels()
         return "*" in ignored or parent_channel_id in ignored
+
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Restore the Slack persona carried by this queued event.
+
+        Context variables are copied when a task is created, but busy-session
+        follow-ups are drained by a task created from the previous turn.  Read
+        the event's own value here so a profile switch cannot inherit the
+        prior turn's display identity.  An absent value deliberately clears
+        the persona for ordinary slash commands and synthetic events.
+        """
+        persona = event.metadata.get(_PROFILE_PERSONA_METADATA_KEY)
+        persona_token = _profile_persona.set(
+            persona if isinstance(persona, dict) else None
+        )
+        slash_user_id = event.metadata.get(_SLASH_USER_ID_METADATA_KEY)
+        slash_token = _slash_user_id.set(
+            str(slash_user_id) if slash_user_id else None
+        )
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            _slash_user_id.reset(slash_token)
+            _profile_persona.reset(persona_token)
 
     async def send(
         self,
@@ -6533,6 +6560,8 @@ class SlackAdapter(BasePlatformAdapter):
             source.profile = str(profile_spec["profile"])
             if thread_ts:
                 self._bind_profile_thread(team_id, channel_id, thread_ts, profile_spec)
+        msg_event.metadata[_PROFILE_PERSONA_METADATA_KEY] = profile_spec
+        msg_event.metadata[_SLASH_USER_ID_METADATA_KEY] = None
 
         # Only react when bot is directly addressed (1:1 DM or @mention).
         # MPIMs are shared surfaces: reacting to every group-DM message (even
@@ -8000,6 +8029,10 @@ class SlackAdapter(BasePlatformAdapter):
             ),
             source=source,
             raw_message=command,
+            metadata={
+                _PROFILE_PERSONA_METADATA_KEY: profile_spec,
+                _SLASH_USER_ID_METADATA_KEY: user_id or None,
+            },
         )
 
         # Stash the Slack response_url so the first reply for this

@@ -1,12 +1,17 @@
 """Slack single-app profile invocation behavior."""
 
+import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.session import SessionSource, build_session_key
 from hermes_cli import slack_cli
+from plugins.platforms.slack import adapter as slack_adapter_module
 from plugins.platforms.slack.adapter import SlackAdapter
 
 
@@ -112,6 +117,84 @@ async def test_normal_send_and_cron_path_keep_app_identity(tmp_path):
     kwargs = client.chat_postMessage.await_args.kwargs
     assert "username" not in kwargs
     assert "icon_emoji" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_queued_profile_switch_restores_event_persona(tmp_path):
+    adapter, client = _adapter(tmp_path / "routes.json")
+    adapter.config.typing_indicator = False
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="done"))
+    event = MessageEvent(
+        text="review this",
+        source=SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            user_id="U1",
+            scope_id="T1",
+            profile="chopper",
+        ),
+        metadata={
+            "_slack_profile_persona": {
+                "profile": "chopper",
+                "display_name": "Chopper",
+                "icon_emoji": ":hermes_chopper:",
+            }
+        },
+    )
+
+    stale = slack_adapter_module._profile_persona.set(
+        {"profile": "nami", "display_name": "Nami", "icon_emoji": ":hermes_nami:"}
+    )
+    try:
+        await adapter._process_message_background(event, build_session_key(event.source))
+    finally:
+        slack_adapter_module._profile_persona.reset(stale)
+
+    kwargs = client.chat_postMessage.await_args.kwargs
+    assert kwargs["username"] == "Chopper"
+    assert kwargs["icon_emoji"] == ":hermes_chopper:"
+
+
+@pytest.mark.asyncio
+async def test_queued_ordinary_slash_clears_stale_persona(tmp_path):
+    adapter, client = _adapter(tmp_path / "routes.json")
+    adapter.config.typing_indicator = False
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="status"))
+    adapter._send_slash_ephemeral = AsyncMock(
+        return_value=SendResult(success=True, message_id="ephemeral")
+    )
+    adapter._slash_command_contexts[("T1", "C1", "U2")] = {
+        "response_url": "https://example.invalid/ephemeral",
+        "user_id": "U2",
+        "ts": time.monotonic(),
+    }
+    event = MessageEvent(
+        text="/status",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            user_id="U2",
+            scope_id="T1",
+        ),
+        metadata={
+            "_slack_profile_persona": None,
+            "_slack_slash_user_id": "U2",
+        },
+    )
+
+    stale = slack_adapter_module._profile_persona.set(
+        {"profile": "nami", "display_name": "Nami", "icon_emoji": ":hermes_nami:"}
+    )
+    try:
+        await adapter._process_message_background(event, build_session_key(event.source))
+    finally:
+        slack_adapter_module._profile_persona.reset(stale)
+
+    adapter._send_slash_ephemeral.assert_awaited_once()
+    client.chat_postMessage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
