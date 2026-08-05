@@ -27,6 +27,73 @@ SLACK_LONG_DESCRIPTION_MIN_CHARACTERS = 175
 SLACK_LONG_DESCRIPTION_MAX_CHARACTERS = 4000
 
 
+def _configured_profile_slashes() -> list[dict]:
+    """Build manifest entries for opt-in Slack profile invocations."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        config = load_gateway_config()
+        if not config.multiplex_profiles:
+            return []
+        slack = config.platforms.get(Platform.SLACK)
+        raw = (slack.extra if slack else {}).get("profile_invocations", [])
+    except Exception as exc:
+        raise RuntimeError(
+            "could not load Slack profile invocation configuration"
+        ) from exc
+    if not isinstance(raw, list):
+        return []
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        profile = str(item.get("profile") or "").strip().lower()
+        slash = str(item.get("slash") or profile).strip().lower().lstrip("/")
+        if (
+            not profile
+            or not slash
+            or slash in seen
+            or len(slash) > 32
+            or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for ch in slash)
+        ):
+            continue
+        seen.add(slash)
+        display_name = str(item.get("display_name") or profile.title())
+        entries.append(
+            {
+                "command": f"/{slash}",
+                "description": f"Run the {display_name} Hermes profile"[:140],
+                "usage_hint": "[request]",
+                "should_escape": False,
+                "url": "https://hermes-agent.local/slack/commands",
+            }
+        )
+    return entries
+
+
+def _merge_profile_slashes(
+    slashes: list[dict], profile_slashes: list[dict] | None = None
+) -> list[dict]:
+    """Pin configured profile slashes while preserving Slack's 50-command cap."""
+    if profile_slashes is None:
+        profile_slashes = _configured_profile_slashes()
+    if not profile_slashes:
+        return slashes
+    profile_names = {entry["command"] for entry in profile_slashes}
+    remaining = [
+        entry
+        for entry in slashes
+        if entry["command"] != "/hermes" and entry["command"] not in profile_names
+    ]
+    hermes_entry = next(
+        (entry for entry in slashes if entry["command"] == "/hermes"),
+        None,
+    )
+    merged = ([hermes_entry] if hermes_entry else []) + profile_slashes + remaining
+    return merged[:50]
+
+
 def _build_full_manifest(
     bot_name: str,
     bot_description: str,
@@ -61,7 +128,13 @@ def _build_full_manifest(
         )
 
     partial = slack_app_manifest()
-    slashes = partial["features"]["slash_commands"]
+    # Slack caps an app at 50 slash commands. Keep /hermes first, then pin
+    # configured profile invocations ahead of lower-priority native commands;
+    # every displaced command remains reachable via /hermes.
+    profile_slashes = _configured_profile_slashes()
+    slashes = _merge_profile_slashes(
+        partial["features"]["slash_commands"], profile_slashes
+    )
 
     features = {
         "app_home": {
@@ -94,6 +167,8 @@ def _build_full_manifest(
         "reactions:read",
         "users:read",
     ]
+    if profile_slashes:
+        bot_scopes.append("chat:write.customize")
 
     bot_events = [
         "app_mention",
@@ -241,7 +316,9 @@ def slack_manifest_command(args) -> int:
     if getattr(args, "slashes_only", False):
         from hermes_cli.commands import slack_app_manifest
 
-        manifest = slack_app_manifest()["features"]["slash_commands"]
+        manifest = _merge_profile_slashes(
+            slack_app_manifest()["features"]["slash_commands"]
+        )
     else:
         manifest = _build_full_manifest(
             name,

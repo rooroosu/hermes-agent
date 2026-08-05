@@ -262,6 +262,14 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     default=None,
 )
 
+# The Slack app can present replies from several isolated Hermes profiles while
+# keeping one Socket Mode connection.  This context is set only for an inbound
+# user turn (including a continued thread), so cron and other synthetic sends
+# retain the Slack app's normal identity.
+_profile_persona: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+    contextvars.ContextVar("_profile_persona", default=None)
+)
+
 
 @dataclass
 class _ThreadContextCache:
@@ -1017,6 +1025,17 @@ class SlackAdapter(BasePlatformAdapter):
         # commands that arrived without a workspace id.
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        # Durable Slack thread -> profile bindings for configured profile
+        # invocations. Values contain only public routing/display metadata;
+        # credentials never enter this store.
+        self._profile_thread_routes: Dict[str, Dict[str, str]] = {}
+        self._PROFILE_THREAD_ROUTES_MAX = 5000
+        # Capture the default gateway-owned path now. During a routed turn the
+        # process-wide HERMES_HOME scope temporarily points at the selected
+        # profile; recomputing then would split one Slack route store across
+        # multiple profile homes.
+        self._profile_route_store = self._profile_route_store_path()
+        self._load_profile_thread_routes()
         # Socket Mode resilience: track runtime connection state so we can
         # self-heal when Slack silently drops the websocket.
         self._app_token: Optional[str] = None
@@ -1517,6 +1536,186 @@ class SlackAdapter(BasePlatformAdapter):
             return self._slash_command_contexts.pop(key, None)
 
         return None
+
+    def _profile_invocation_specs(self) -> Dict[str, Dict[str, Any]]:
+        """Return configured Slack invocation aliases keyed by slash name.
+
+        Configuration lives under ``gateway.slack.profile_invocations`` and is
+        deliberately opt-in. Example::
+
+            profile_invocations:
+              - profile: nami
+                slash: nami
+                aliases: [nami, "나미"]
+                display_name: Nami
+                icon_emoji: ":hermes_nami:"
+        """
+        # Display customization is truthful only when the gateway will also
+        # honor source.profile for runtime/session selection. Fail closed on a
+        # single-profile gateway instead of showing "Nami" while running Luffy.
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return {}
+        raw = self.config.extra.get("profile_invocations", [])
+        if not isinstance(raw, list):
+            return {}
+        specs: Dict[str, Dict[str, Any]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            profile = str(item.get("profile") or "").strip().lower()
+            slash = str(item.get("slash") or profile).strip().lower().lstrip("/")
+            if not profile or not slash or not re.fullmatch(r"[a-z0-9_-]{1,32}", slash):
+                continue
+            try:
+                from hermes_cli.profiles import profile_exists, validate_profile_name
+
+                validate_profile_name(profile)
+                if not profile_exists(profile):
+                    logger.error(
+                        "[Slack] Profile invocation /%s targets missing profile %s",
+                        slash,
+                        profile,
+                    )
+                    continue
+            except (ImportError, ValueError, OSError):
+                continue
+            aliases = item.get("aliases") or [profile]
+            if isinstance(aliases, str):
+                aliases = [aliases]
+            aliases = [
+                str(alias).strip().casefold()
+                for alias in aliases
+                if str(alias).strip()
+            ]
+            if profile.casefold() not in aliases:
+                aliases.append(profile.casefold())
+            icon = str(item.get("icon_emoji") or "").strip()
+            if icon and not (icon.startswith(":") and icon.endswith(":")):
+                icon = f":{icon.strip(':')}:"
+            specs[slash] = {
+                "profile": profile,
+                "slash": slash,
+                "aliases": aliases,
+                "display_name": str(item.get("display_name") or profile.title())[:80],
+                "icon_emoji": icon,
+            }
+        return specs
+
+    def _profile_route_store_path(self) -> _Path:
+        captured = getattr(self, "_profile_route_store", None)
+        if captured is not None:
+            return captured
+        configured = str(self.config.extra.get("profile_invocation_store") or "").strip()
+        if configured:
+            return _Path(configured).expanduser()
+        from hermes_constants import get_hermes_home
+
+        return _Path(get_hermes_home()) / "gateway" / "slack-profile-invocations.json"
+
+    def _load_profile_thread_routes(self) -> None:
+        try:
+            payload = json.loads(self._profile_route_store_path().read_text(encoding="utf-8"))
+            routes = payload.get("routes", {}) if isinstance(payload, dict) else {}
+            if isinstance(routes, dict):
+                self._profile_thread_routes = {
+                    str(key): value
+                    for key, value in routes.items()
+                    if isinstance(value, dict) and value.get("profile")
+                }
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("[Slack] Could not load profile thread routes: %s", exc)
+
+    def _save_profile_thread_routes(self) -> None:
+        path = self._profile_route_store_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"version": 1, "routes": self._profile_thread_routes}, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("[Slack] Could not persist profile thread routes: %s", exc)
+
+    @staticmethod
+    def _profile_thread_key(team_id: str, channel_id: str, thread_ts: str) -> str:
+        return "\x1f".join((str(team_id or ""), str(channel_id), str(thread_ts)))
+
+    def _bind_profile_thread(
+        self, team_id: str, channel_id: str, thread_ts: str, spec: Dict[str, Any]
+    ) -> None:
+        if not thread_ts:
+            return
+        key = self._profile_thread_key(team_id, channel_id, thread_ts)
+        self._profile_thread_routes[key] = {
+            "profile": str(spec["profile"]),
+            "display_name": str(spec.get("display_name") or ""),
+            "icon_emoji": str(spec.get("icon_emoji") or ""),
+        }
+        if len(self._profile_thread_routes) > self._PROFILE_THREAD_ROUTES_MAX:
+            excess = len(self._profile_thread_routes) - self._PROFILE_THREAD_ROUTES_MAX
+            for old_key in list(self._profile_thread_routes)[:excess]:
+                self._profile_thread_routes.pop(old_key, None)
+        self._save_profile_thread_routes()
+
+    def _continued_profile_spec(
+        self, team_id: str, channel_id: str, thread_ts: Optional[str]
+    ) -> Optional[Dict[str, str]]:
+        if not thread_ts:
+            return None
+        stored = self._profile_thread_routes.get(
+            self._profile_thread_key(team_id, channel_id, thread_ts)
+        )
+        if not stored:
+            return None
+        # Configuration is the authority. A stale/tampered route file must not
+        # keep invoking a profile that the operator removed from Slack.
+        configured = {
+            str(spec["profile"]): spec
+            for spec in self._profile_invocation_specs().values()
+        }
+        return configured.get(str(stored.get("profile") or ""))
+
+    def _match_profile_alias(
+        self, text: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        stripped = str(text or "").lstrip()
+        folded = stripped.casefold()
+        for spec in self._profile_invocation_specs().values():
+            for alias in sorted(spec["aliases"], key=len, reverse=True):
+                if folded == alias:
+                    return spec, ""
+                if folded.startswith(alias) and len(stripped) > len(alias):
+                    boundary = stripped[len(alias)]
+                    if boundary.isspace() or boundary in ":：,-":
+                        return spec, stripped[len(alias) :].lstrip(" \t:：,-")
+        return None, text
+
+    def _profile_slash_source_allowed(self, source: Any) -> bool:
+        """Apply Slack's user/channel gates before a crew slash dispatch."""
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        auth_fn = getattr(runner, "_is_user_authorized", None)
+        if source.user_id and callable(auth_fn) and not auth_fn(source):
+            logger.warning(
+                "[Slack] Early reject of unauthorized profile slash user %s in channel %s",
+                source.user_id,
+                source.chat_id,
+            )
+            return False
+        if source.chat_type != "dm":
+            allowed_channels = self._slack_allowed_channels()
+            if allowed_channels and source.chat_id not in allowed_channels:
+                logger.info(
+                    "[Slack] Ignoring profile slash in non-allowed channel %s",
+                    source.chat_id,
+                )
+                return False
+        return True
 
     async def _send_slash_ephemeral(
         self,
@@ -2055,6 +2254,8 @@ class SlackAdapter(BasePlatformAdapter):
             import re as _re
 
             _slash_names = [name for name, _d, _h in slack_native_slashes()]
+            _slash_names.extend(self._profile_invocation_specs())
+            _slash_names = list(dict.fromkeys(_slash_names))
             if _slash_names:
                 _slash_pattern = _re.compile(
                     r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
@@ -2065,10 +2266,16 @@ class SlackAdapter(BasePlatformAdapter):
             @self._app.command(_slash_pattern)
             async def handle_hermes_command(ack, command):
                 slash = (command.get("command") or "").lstrip("/")
-                await ack(
-                    response_type="ephemeral",
-                    text=f"Running `/{slash}`…",
-                )
+                if slash in self._profile_invocation_specs():
+                    # A profile slash produces one public customized response.
+                    # Acknowledge silently so Slack does not leave a stale
+                    # ephemeral "Running" placeholder behind.
+                    await ack()
+                else:
+                    await ack(
+                        response_type="ephemeral",
+                        text=f"Running `/{slash}`…",
+                    )
                 await self._handle_slash_command(command)
 
             # Register Block Kit action handlers for approval buttons
@@ -2459,12 +2666,13 @@ class SlackAdapter(BasePlatformAdapter):
         thread_ts = None
         try:
             team_id = self._metadata_team_id(metadata)
+            persona = _profile_persona.get()
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            slash_ctx = None if persona else self._pop_slash_context(chat_id, team_id)
             if slash_ctx:
                 ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
@@ -2551,6 +2759,11 @@ class SlackAdapter(BasePlatformAdapter):
                     # Only broadcast the first chunk of the first reply
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
+                if persona:
+                    if persona.get("display_name"):
+                        kwargs["username"] = persona["display_name"]
+                    if persona.get("icon_emoji"):
+                        kwargs["icon_emoji"] = persona["icon_emoji"]
 
                 try:
                     last_result = await self._get_client(
@@ -2578,6 +2791,13 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
+                if persona:
+                    self._bind_profile_thread(
+                        team_id,
+                        chat_id,
+                        thread_ts or str(sent_ts),
+                        persona,
+                    )
                 self._bot_message_ts.add(
                     self._workspace_message_marker(team_id, sent_ts)
                 )
@@ -6298,6 +6518,22 @@ class SlackAdapter(BasePlatformAdapter):
             },
         )
 
+        # Resolve explicit ``@App <alias> ...`` invocations only after Slack's
+        # authorization/channel/mention gates above have accepted the event.
+        # A thread binding then keeps later unqualified replies on the same
+        # profile, including after a gateway restart.
+        profile_spec = None
+        if not is_command_text and (is_mentioned or is_one_to_one_dm):
+            profile_spec, routed_text = self._match_profile_alias(msg_event.text)
+            if profile_spec:
+                msg_event.text = routed_text or "/profile"
+        if profile_spec is None:
+            profile_spec = self._continued_profile_spec(team_id, channel_id, thread_ts)
+        if profile_spec:
+            source.profile = str(profile_spec["profile"])
+            if thread_ts:
+                self._bind_profile_thread(team_id, channel_id, thread_ts, profile_spec)
+
         # Only react when bot is directly addressed (1:1 DM or @mention).
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
@@ -6341,7 +6577,11 @@ class SlackAdapter(BasePlatformAdapter):
                 )[-self._PROCESSED_MESSAGE_TS_MAX :]
                 self._processed_message_ts = dict(newest_items)
 
-        await self.handle_message(msg_event)
+        _profile_token = _profile_persona.set(profile_spec)
+        try:
+            await self.handle_message(msg_event)
+        finally:
+            _profile_persona.reset(_profile_token)
 
     # ----- Approval button support (Block Kit) -----
 
@@ -7648,12 +7888,30 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+        profile_spec = self._profile_invocation_specs().get(slash_name)
+
+        # Crew slashes must obey the same hard channel kill switch as normal
+        # Slack messages. Stop before stamping source.profile or invoking the
+        # gateway so an ignored channel cannot consume another profile's turn.
+        if profile_spec and self._is_ignored_channel(channel_id):
+            logger.info(
+                "[Slack] Ignoring profile slash /%s in ignored channel %s",
+                slash_name,
+                channel_id,
+            )
+            return
 
         # Track which workspace owns this channel
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
 
-        if slash_name in {"hermes", ""}:
+        if profile_spec:
+            # Crew/profile slashes are prompts, not gateway control commands.
+            # Their reply is public and uses the selected profile's display
+            # identity; ordinary native slashes keep the existing ephemeral
+            # response path.
+            text = raw_text.strip() or "/profile"
+        elif slash_name in {"hermes", ""}:
             # Legacy /hermes <subcommand> [args] routing + free-form questions.
             # Empty slash_name falls into this branch for backward compat
             # with any caller that didn't populate command["command"].
@@ -7728,6 +7986,12 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             scope_id=team_id or None,
         )
+        if profile_spec:
+            if not self._profile_slash_source_allowed(source):
+                return
+            source.profile = str(profile_spec["profile"])
+            if thread_id:
+                self._bind_profile_thread(team_id, channel_id, thread_id, profile_spec)
 
         event = MessageEvent(
             text=text,
@@ -7745,7 +8009,13 @@ class SlackAdapter(BasePlatformAdapter):
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
         response_url = command.get("response_url", "")
-        if response_url and user_id and channel_id and text.startswith("/"):
+        if (
+            not profile_spec
+            and response_url
+            and user_id
+            and channel_id
+            and text.startswith("/")
+        ):
             context_key = (
                 (str(team_id), str(channel_id), str(user_id))
                 if team_id
@@ -7783,9 +8053,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Set the ContextVar so send() can match the correct stashed
         # response_url even when multiple users slash concurrently.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
+        _profile_token = _profile_persona.set(profile_spec)
         try:
             await self.handle_message(event)
         finally:
+            _profile_persona.reset(_profile_token)
             _slash_user_id.reset(_slash_user_id_token)
 
     def _build_thread_session_key(
