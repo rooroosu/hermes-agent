@@ -7918,6 +7918,12 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
         profile_spec = self._profile_invocation_specs().get(slash_name)
+        profile_routed_text = None
+        if profile_spec is None and slash_name in {"hermes", ""}:
+            # Slack caps apps at 25 slash commands.  Long-lived Hermes apps
+            # may already be at that limit, so keep the single-entry-point
+            # form useful as a no-slot fallback: ``/hermes nami ...``.
+            profile_spec, profile_routed_text = self._match_profile_alias(raw_text)
 
         # Crew slashes must obey the same hard channel kill switch as normal
         # Slack messages. Stop before stamping source.profile or invoking the
@@ -7939,7 +7945,8 @@ class SlackAdapter(BasePlatformAdapter):
             # Their reply is public and uses the selected profile's display
             # identity; ordinary native slashes keep the existing ephemeral
             # response path.
-            text = raw_text.strip() or "/profile"
+            routed = raw_text if profile_routed_text is None else profile_routed_text
+            text = routed.strip() or "/profile"
         elif slash_name in {"hermes", ""}:
             # Legacy /hermes <subcommand> [args] routing + free-form questions.
             # Empty slash_name falls into this branch for backward compat

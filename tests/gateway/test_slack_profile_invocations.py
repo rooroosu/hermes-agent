@@ -111,6 +111,42 @@ async def test_profile_slash_is_public_customized_and_stamps_source(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_hermes_slash_routes_profile_without_extra_command_slot(tmp_path):
+    adapter, client = _adapter(tmp_path / "routes.json")
+    captured = []
+
+    async def handle(event):
+        captured.append(event)
+        await adapter.send(
+            event.source.chat_id,
+            "done",
+            metadata={"slack_team_id": event.source.scope_id},
+        )
+
+    adapter.handle_message = handle
+    command = {
+        "command": "/hermes",
+        "text": "나미 calculate coverage",
+        "user_id": "U1",
+        "channel_id": "C1",
+        "team_id": "T1",
+        "response_url": "https://example.invalid/ephemeral",
+    }
+    with (
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        await adapter._handle_slash_command(command)
+
+    assert captured[0].source.profile == "nami"
+    assert captured[0].text == "calculate coverage"
+    assert adapter._slash_command_contexts == {}
+    kwargs = client.chat_postMessage.await_args.kwargs
+    assert kwargs["username"] == "Nami"
+    assert kwargs["icon_emoji"] == ":hermes_nami:"
+
+
+@pytest.mark.asyncio
 async def test_normal_send_and_cron_path_keep_app_identity(tmp_path):
     adapter, client = _adapter(tmp_path / "routes.json")
     await adapter.send("C1", "scheduled report", metadata={"slack_team_id": "T1"})
