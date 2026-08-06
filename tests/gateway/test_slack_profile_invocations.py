@@ -358,6 +358,70 @@ def test_stale_thread_binding_cannot_bypass_current_config(tmp_path):
     assert adapter._continued_profile_spec("T1", "C1", "100.001") is None
 
 
+@pytest.mark.asyncio
+async def test_explicit_alias_switches_profile_in_bound_thread(tmp_path):
+    store = tmp_path / "routes.json"
+    adapter, _ = _adapter(store)
+    adapter.config.extra["profile_invocations"] = [
+        {
+            "profile": "nami",
+            "slash": "nami",
+            "aliases": ["nami", "나미"],
+            "display_name": "Nami",
+            "icon_emoji": ":hermes_nami:",
+        },
+        {
+            "profile": "chopper",
+            "slash": "chopper",
+            "aliases": ["chopper", "쵸파", "초파"],
+            "display_name": "Chopper",
+            "icon_emoji": ":hermes_chopper:",
+        },
+    ]
+    adapter._bot_user_id = "U_BOT"
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+    adapter._fetch_thread_context = AsyncMock(return_value="")
+    adapter._fetch_thread_parent_text = AsyncMock(return_value="root")
+    adapter._has_active_session_for_thread = MagicMock(return_value=False)
+    adapter._mentioned_threads.add("100.001")
+    adapter._bind_profile_thread(
+        "T1",
+        "C1",
+        "100.001",
+        {
+            "profile": "nami",
+            "display_name": "Nami",
+            "icon_emoji": ":hermes_nami:",
+        },
+    )
+
+    with (
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        await adapter._handle_slack_message(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "team": "T1",
+                "user": "U1",
+                "client_msg_id": "m1",
+                "text": "쵸파 프로필 이름을 알려줘",
+                "ts": "101.001",
+                "thread_ts": "100.001",
+            }
+        )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.profile == "chopper"
+    assert event.text == "프로필 이름을 알려줘"
+    assert event.metadata["_slack_profile_persona"]["display_name"] == "Chopper"
+    persisted = json.loads(store.read_text())["routes"]["T1\u001fC1\u001f100.001"]
+    assert persisted["profile"] == "chopper"
+
+
 def test_manifest_pins_profile_slashes_and_customize_scope(monkeypatch):
     monkeypatch.setattr(
         slack_cli,

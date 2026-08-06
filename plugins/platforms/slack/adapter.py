@@ -6550,12 +6550,17 @@ class SlackAdapter(BasePlatformAdapter):
         # A thread binding then keeps later unqualified replies on the same
         # profile, including after a gateway restart.
         profile_spec = None
-        if not is_command_text and (is_mentioned or is_one_to_one_dm):
+        continued_profile_spec = self._continued_profile_spec(
+            team_id, channel_id, thread_ts
+        )
+        if not is_command_text and (
+            is_mentioned or is_one_to_one_dm or continued_profile_spec is not None
+        ):
             profile_spec, routed_text = self._match_profile_alias(msg_event.text)
             if profile_spec:
                 msg_event.text = routed_text or "/profile"
         if profile_spec is None:
-            profile_spec = self._continued_profile_spec(team_id, channel_id, thread_ts)
+            profile_spec = continued_profile_spec
         if profile_spec:
             source.profile = str(profile_spec["profile"])
             if thread_ts:
