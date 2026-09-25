@@ -4559,3 +4559,105 @@ class TestSlackUserAgent:
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
 
+
+class TestSlackPersonaDoesNotBindInbound:
+    """Outbound persona posts must not steal the thread's inbound profile."""
+
+    def _adapter(self):
+        config = PlatformConfig(enabled=True, token="***")
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._app.client.chat_postMessage = AsyncMock(return_value={"ts": "9.001"})
+        a._bot_user_id = "U_BOT"
+        a._running = True
+        a._profile_thread_routes = {}
+        a._save_profile_thread_routes = MagicMock()
+        a.stop_typing = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_persona_send_does_not_bind_thread(self):
+        adapter = self._adapter()
+        persona = {
+            "profile": "chopper",
+            "display_name": "Chopper",
+            "icon_emoji": ":hermes_chopper:",
+        }
+        token = _slack_mod._profile_persona.set(persona)
+        try:
+            result = await adapter.send(
+                "C123",
+                "sidecar note",
+                reply_to="8.000",
+                metadata={"thread_id": "8.000", "team_id": "T1"},
+            )
+        finally:
+            _slack_mod._profile_persona.reset(token)
+
+        assert result.success is True
+        assert adapter._profile_thread_routes == {}
+        adapter._save_profile_thread_routes.assert_not_called()
+        posted = adapter._app.client.chat_postMessage.await_args.kwargs
+        assert posted["username"] == "Chopper"
+        assert posted["icon_emoji"] == ":hermes_chopper:"
+
+
+class TestSlackEmptyAliasesStayEmpty:
+    """aliases: [] must not fall back to the profile name at runtime."""
+
+    def _specs_for(self, invocations):
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"profile_invocations": invocations},
+        )
+        adapter = SlackAdapter(config)
+        adapter._profile_thread_routes = {}
+        adapter._save_profile_thread_routes = MagicMock()
+        return adapter
+
+    def test_empty_aliases_do_not_match_profile_name(self):
+        adapter = self._specs_for(
+            [
+                {
+                    "profile": "chopper",
+                    "slash": "chopper",
+                    "aliases": [],
+                    "display_name": "Chopper",
+                }
+            ]
+        )
+        with patch(
+            "agent.secret_scope.is_multiplex_active", return_value=True
+        ), patch("hermes_cli.profiles.profile_exists", return_value=True), patch(
+            "hermes_cli.profiles.validate_profile_name"
+        ):
+            specs = adapter._profile_invocation_specs()
+            matched, _rest = adapter._match_profile_alias("chopper please check")
+
+        assert "chopper" in specs
+        assert specs["chopper"]["aliases"] == []
+        assert matched is None
+
+    def test_slash_name_still_registered_when_aliases_empty(self):
+        adapter = self._specs_for(
+            [
+                {
+                    "profile": "chopper",
+                    "slash": "chopper",
+                    "aliases": [],
+                    "display_name": "Chopper",
+                }
+            ]
+        )
+        with patch(
+            "agent.secret_scope.is_multiplex_active", return_value=True
+        ), patch("hermes_cli.profiles.profile_exists", return_value=True), patch(
+            "hermes_cli.profiles.validate_profile_name"
+        ):
+            specs = adapter._profile_invocation_specs()
+
+        assert specs["chopper"]["slash"] == "chopper"
+        assert specs["chopper"]["profile"] == "chopper"
+

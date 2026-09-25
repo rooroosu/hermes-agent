@@ -42,6 +42,7 @@ class TurnContext:
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
     tool_progress_enabled: bool = False
+    delegation_progress_enabled: bool = False
 
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
@@ -53,6 +54,9 @@ class TurnContext:
     last_was_terminal_block: list = field(default_factory=lambda: [False])
     repeat_count: list = field(default_factory=lambda: [0])
     long_tool_hint_fired: list = field(default_factory=lambda: [False])
+    delegation_text: dict = field(default_factory=dict)
+    delegation_profiles: dict = field(default_factory=dict)
+    delegation_lock: Any = None
     agent_holder: list = field(default_factory=lambda: [None])
 
     # --- constants / cleanup bookkeeping ---------------------------------

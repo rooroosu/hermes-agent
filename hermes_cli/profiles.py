@@ -978,16 +978,23 @@ def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
     if not multiplex:
         return [(active, get_profile_dir(active))]
 
-    serve: List[Tuple[str, Path]] = [("default", _get_default_hermes_home())]
+    # Named gateways (Luffy) must not also serve the retired root home
+    # ("default") or a husk named jarvis. Root+Jarvis boot races stole the
+    # Telegram token. The default home is included only when THIS process
+    # is the default profile.
+    serve: List[Tuple[str, Path]] = []
+    if active == "default":
+        serve.append(("default", _get_default_hermes_home()))
 
+    _SKIP_SERVE = {"default", "jarvis"}
     profiles_root = _get_profiles_root()
     if profiles_root.is_dir():
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue
             name = entry.name
-            if name == "default":
-                continue  # default is the built-in entry already added above
+            if name in _SKIP_SERVE:
+                continue
             if not _PROFILE_ID_RE.match(name):
                 continue
             serve.append((name, entry))

@@ -3564,9 +3564,127 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
 
+    async def _send_delegation_message(
+        self, profile_name: str, content: str
+    ) -> None:
+        """Post one specialist child utterance into the originating thread."""
+        ctx = self._ctx
+        adapter = self._runner._adapter_for_source(ctx.source)
+        if adapter is None or not content.strip():
+            return
+        metadata = dict(ctx._progress_metadata or {})
+        resolver = getattr(adapter, "profile_persona_for_name", None)
+        if not callable(resolver):
+            slack_identity_adapter = self._runner.adapters.get(Platform.SLACK)
+            resolver = getattr(
+                slack_identity_adapter, "profile_persona_for_name", None
+            )
+            if slack_identity_adapter is not None and callable(resolver):
+                adapter = slack_identity_adapter
+        persona = resolver(profile_name) if callable(resolver) else None
+        if isinstance(persona, dict):
+            metadata["_slack_profile_persona"] = persona
+        result = await adapter.send(
+            chat_id=ctx.source.chat_id,
+            content=content,
+            reply_to=ctx._progress_reply_to,
+            metadata=metadata or None,
+        )
+        if not getattr(result, "success", False):
+            logger.warning(
+                "Delegated profile message delivery failed for %s: %s",
+                profile_name,
+                getattr(result, "error", "unknown error"),
+            )
+
+    def _schedule_delegation_message(self, profile_name: str, content: str) -> None:
+        future = safe_schedule_threadsafe(
+            self._send_delegation_message(profile_name, content),
+            self._runner._gateway_loop,
+            logger=logger,
+            log_message="delegated profile message scheduling failed",
+        )
+        if future is None:
+            logger.warning(
+                "Delegated profile message was not scheduled for %s: gateway loop unavailable",
+                profile_name,
+            )
+            return
+
+        def _observe_delivery(done) -> None:
+            try:
+                done.result()
+            except Exception:
+                logger.warning(
+                    "Delegated profile message task failed for %s",
+                    profile_name,
+                    exc_info=True,
+                )
+
+        future.add_done_callback(_observe_delivery)
+
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # Transparent specialist delegation for Slack. delegate_task children
+        # often outlive the parent turn, so this cannot use the per-turn
+        # progress sender (it is cancelled when Luffy's immediate turn ends).
+        # Keep a tiny per-child transcript buffer and post only start + final
+        # utterance under the configured profile persona; internal tool calls
+        # and reasoning remain hidden.
+        if str(event_type).startswith("subagent."):
+            if not ctx.delegation_progress_enabled:
+                return
+            profile_name = str(kwargs.get("profile_name") or "").strip().lower()
+            if not profile_name:
+                return
+            child_key = str(
+                kwargs.get("child_session_id")
+                or kwargs.get("subagent_id")
+                or f"task-{kwargs.get('task_index', 0)}"
+            )
+            lock = ctx.delegation_lock
+            if event_type == "subagent.start":
+                logger.info(
+                    "Relaying Slack delegation transcript for profile=%s child=%s",
+                    profile_name,
+                    child_key,
+                )
+                if lock:
+                    with lock:
+                        ctx.delegation_text[child_key] = []
+                        ctx.delegation_profiles[child_key] = profile_name
+                self._schedule_delegation_message(
+                    profile_name,
+                    (
+                        f"_{profile_name.title()}가 위임 작업을 시작했습니다._\n"
+                        f"> {str(preview or kwargs.get('goal') or '').strip()[:240]}"
+                    ).rstrip(),
+                )
+                return
+            if event_type == "subagent.text":
+                if preview:
+                    if lock:
+                        with lock:
+                            ctx.delegation_text.setdefault(child_key, []).append(str(preview))
+                return
+            if event_type == "subagent.complete":
+                if lock:
+                    with lock:
+                        text = "".join(ctx.delegation_text.pop(child_key, [])).strip()
+                        ctx.delegation_profiles.pop(child_key, None)
+                else:
+                    text = ""
+                status = str(kwargs.get("status") or "completed")
+                if not text:
+                    text = str(kwargs.get("summary") or preview or "").strip()
+                if not text:
+                    text = "작업을 완료했습니다." if status == "completed" else f"작업 상태: {status}"
+                if status != "completed":
+                    text = f"⚠️ 작업이 {status} 상태로 끝났습니다.\n{text}"
+                self._schedule_delegation_message(profile_name, text)
+                return
+            return
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -4739,9 +4857,16 @@ class TurnRunner:
                 ctx.needs_progress_queue
                 or ctx.log_mode_enabled
                 or ctx._live_status_adapter is not None
+                or ctx.delegation_progress_enabled
             )
             else None
         )
+        if ctx.delegation_progress_enabled:
+            logger.info(
+                "Slack delegation transcript callback armed session=%s adapter=%s",
+                ctx.session_key,
+                type(self._runner._adapter_for_source(ctx.source)).__name__,
+            )
         # Discord voice verbal-ack hook (fires once per turn on first tool
         # call; armed only when in a voice channel with the mixer running).
         agent.tool_start_callback = (
@@ -20435,6 +20560,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+            user_id = getattr(source, "user_id", None)
+            if user_id:
+                metadata = dict(metadata or {})
+                metadata["slack_requester_user_id"] = str(user_id)
         return metadata
 
     def _thread_metadata_for_target(
@@ -24201,6 +24330,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         _thinking_enabled = _thinking_mode != "off"
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        # Capability-gate this instead of comparing the source enum. In a
+        # multiplex gateway the same native Slack adapter can be reached
+        # through a routed source whose platform wrapper is not identity-equal
+        # to this module's Platform.SLACK enum. The adapter capability is the
+        # actual requirement for truthful name/icon attribution.
+        _delegation_adapter = self._adapter_for_source(source)
+        _source_platform_name = str(
+            getattr(getattr(source, "platform", None), "value", None)
+            or getattr(source, "platform", "")
+        ).strip().lower()
+        delegation_progress_enabled = (
+            _source_platform_name == "slack"
+            or callable(
+                getattr(_delegation_adapter, "profile_persona_for_name", None)
+            )
+        )
 
 
         # Queue for progress messages (thread-safe)
@@ -24273,6 +24418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
             tool_progress_enabled=tool_progress_enabled,
+            delegation_progress_enabled=delegation_progress_enabled,
             progress_queue=progress_queue,
             log_queue=log_queue,
             last_progress_msg=last_progress_msg,
@@ -24280,6 +24426,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             last_was_terminal_block=last_was_terminal_block,
             repeat_count=repeat_count,
             long_tool_hint_fired=long_tool_hint_fired,
+            delegation_lock=threading.Lock(),
             _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,

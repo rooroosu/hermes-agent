@@ -960,10 +960,18 @@ class SlackAdapter(BasePlatformAdapter):
         # user never clicks would otherwise leak its entry forever. Keys may
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
+        # Approval prompt marker -> the already-authorized Slack user who
+        # triggered the agent turn. Interactive payloads do not carry the
+        # Hermes profile stamp, so re-running profile-scoped auth on a button
+        # click can reject the same owner who was authorized at message intake.
+        # Binding the button to its requester preserves least privilege without
+        # widening SLACK_ALLOWED_USERS globally.
+        self._approval_requesters: Dict[Any, str] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
+        self._clarify_requesters: Dict[Any, str] = {}
         self._CLARIFY_RESOLVED_MAX = 1000
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
@@ -1045,6 +1053,13 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # The Slack SDK performs its own reconnect while the websocket is
+        # momentarily disconnected.  Do not tear the handler down on the first
+        # failed probe: doing so can close the SDK's shared aiohttp session
+        # while its reconnect coroutine is still inside connect(), leaving a
+        # zombie task that retries "Session is closed" forever.
+        self._socket_unhealthy_since_monotonic: Optional[float] = None
+        self._socket_reconnect_grace_s = 30.0
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
         self._socket_handler_started_monotonic: Optional[float] = None
@@ -1203,7 +1218,26 @@ class SlackAdapter(BasePlatformAdapter):
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         self._socket_handler_started_monotonic = time.monotonic()
+        self._socket_unhealthy_since_monotonic = None
         task.add_done_callback(self._on_socket_mode_task_done)
+
+    def _socket_restart_grace_elapsed(self) -> bool:
+        """Return True only after a transport fault survives the grace window.
+
+        A single disconnected/stale observation commonly occurs while
+        slack_sdk is already replacing its websocket.  Waiting for a second,
+        sustained observation lets that native reconnect finish and prevents
+        the watchdog from racing it.  Missing/stopped top-level handler tasks
+        remain immediate restart conditions because no SDK reconnect can
+        recover those states.
+        """
+        now = time.monotonic()
+        if self._socket_unhealthy_since_monotonic is None:
+            self._socket_unhealthy_since_monotonic = now
+            return False
+        return (
+            now - self._socket_unhealthy_since_monotonic
+        ) >= self._socket_reconnect_grace_s
 
     async def _stop_socket_mode_handler(self) -> None:
         """Stop Socket Mode handler and task.
@@ -1328,21 +1362,33 @@ class SlackAdapter(BasePlatformAdapter):
 
                 task = self._socket_mode_task
                 if task is None:
+                    self._socket_unhealthy_since_monotonic = None
                     await self._restart_socket_mode("socket task missing")
                     continue
 
                 if task.done():
+                    self._socket_unhealthy_since_monotonic = None
                     await self._restart_socket_mode("socket task stopped")
                     continue
 
                 connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
-                elif self._socket_ping_pong_stale():
+                stale = self._socket_ping_pong_stale()
+                if connected is False or stale:
+                    if not self._socket_restart_grace_elapsed():
+                        continue
+                    reason = (
+                        "transport disconnected"
+                        if connected is False
+                        else "ping/pong stale"
+                    )
                     # is_connected() can lie when the aiohttp session is closed
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
-                    await self._restart_socket_mode("ping/pong stale")
+                    await self._restart_socket_mode(reason)
+                else:
+                    # A native Slack SDK reconnect completed within the grace
+                    # window, so a future fault must start a fresh observation.
+                    self._socket_unhealthy_since_monotonic = None
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1583,15 +1629,24 @@ class SlackAdapter(BasePlatformAdapter):
                     continue
             except (ImportError, ValueError, OSError):
                 continue
-            aliases = item.get("aliases") or [profile]
-            if isinstance(aliases, str):
-                aliases = [aliases]
+            # Explicit aliases: [] means inbound words stay off (slash still
+            # works). Missing aliases still default to the profile name.
+            # A non-empty list keeps the old "also accept the profile name"
+            # append so operators do not have to repeat it.
+            if "aliases" in item:
+                raw_aliases = item.get("aliases")
+            else:
+                raw_aliases = [profile]
+            if isinstance(raw_aliases, str):
+                raw_aliases = [raw_aliases]
+            if not isinstance(raw_aliases, (list, tuple)):
+                raw_aliases = []
             aliases = [
                 str(alias).strip().casefold()
-                for alias in aliases
+                for alias in raw_aliases
                 if str(alias).strip()
             ]
-            if profile.casefold() not in aliases:
+            if aliases and profile.casefold() not in aliases:
                 aliases.append(profile.casefold())
             icon = str(item.get("icon_emoji") or "").strip()
             if icon and not (icon.startswith(":") and icon.endswith(":")):
@@ -1604,6 +1659,22 @@ class SlackAdapter(BasePlatformAdapter):
                 "icon_emoji": icon,
             }
         return specs
+
+    def profile_persona_for_name(self, profile_name: str) -> Optional[Dict[str, Any]]:
+        """Return the configured, validated Slack persona for a profile.
+
+        Outbound delegation transcripts use this public resolver instead of
+        trusting caller-supplied username/icon metadata.  That keeps visual
+        attribution limited to real multiplex profiles in the operator's
+        allowlist.
+        """
+        wanted = str(profile_name or "").strip().lower()
+        if not wanted:
+            return None
+        for spec in self._profile_invocation_specs().values():
+            if str(spec.get("profile") or "").lower() == wanted:
+                return dict(spec)
+        return None
 
     def _profile_route_store_path(self) -> _Path:
         captured = getattr(self, "_profile_route_store", None)
@@ -2694,6 +2765,17 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             team_id = self._metadata_team_id(metadata)
             persona = _profile_persona.get()
+            metadata_persona = (
+                metadata.get(_PROFILE_PERSONA_METADATA_KEY)
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(metadata_persona, dict):
+                resolved_persona = self.profile_persona_for_name(
+                    metadata_persona.get("profile")
+                )
+                if resolved_persona is not None:
+                    persona = resolved_persona
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have
@@ -2818,13 +2900,10 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
-                if persona:
-                    self._bind_profile_thread(
-                        team_id,
-                        chat_id,
-                        thread_ts or str(sent_ts),
-                        persona,
-                    )
+                # Persona is display-only (delegate_task name/icon). Binding
+                # here stole the thread so the next human reply went to the
+                # sidecar (Chopper) instead of the orchestrator.
+                # Explicit /slash and alias inbound still bind at receive time.
                 self._bot_message_ts.add(
                     self._workspace_message_marker(team_id, sent_ts)
                 )
@@ -6713,11 +6792,18 @@ class SlackAdapter(BasePlatformAdapter):
             msg_ts = result.get("ts", "")
             if msg_ts:
                 team_id = self._metadata_team_id(metadata)
-                self._approval_resolved[
-                    self._workspace_message_marker(team_id, msg_ts)
-                ] = False
+                approval_marker = self._workspace_message_marker(team_id, msg_ts)
+                self._approval_resolved[approval_marker] = False
+                requester_user_id = str(
+                    (metadata or {}).get("slack_requester_user_id") or ""
+                ).strip()
+                if requester_user_id:
+                    self._approval_requesters[approval_marker] = requester_user_id
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._approval_requesters, self._APPROVAL_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -6896,14 +6982,26 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            team_id = self._metadata_team_id(metadata)
+            result = await self._get_client(
+                chat_id, team_id=team_id
+            ).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 # Mark unresolved so the action handler's atomic-pop guard can
                 # reject double-clicks (mirrors _approval_resolved).
-                self._clarify_resolved[msg_ts] = False
+                clarify_marker = self._workspace_message_marker(team_id, msg_ts)
+                self._clarify_resolved[clarify_marker] = False
+                requester_user_id = str(
+                    (metadata or {}).get("slack_requester_user_id") or ""
+                ).strip()
+                if requester_user_id:
+                    self._clarify_requesters[clarify_marker] = requester_user_id
                 self._trim_oldest_dict_entries(
                     self._clarify_resolved, self._CLARIFY_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._clarify_requesters, self._CLARIFY_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -7132,11 +7230,17 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
-            team_id=team_id,
+        approval_key = self._workspace_message_marker(team_id, msg_ts)
+        # Older or metadata-poor send paths key prompts by timestamp only.
+        # Select that key before requester authorization so the initiating
+        # user receives the same least-privilege exception in both cases.
+        if msg_ts in self._approval_resolved:
+            approval_key = msg_ts
+        expected_requester = self._approval_requesters.get(approval_key)
+        requester_matches = bool(expected_requester and user_id == expected_requester)
+
+        if not requester_matches and not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, user_name=user_name, team_id=team_id
         ):
             logger.warning(
                 "[Slack] Unauthorized approval click by %s (%s) - ignoring",
@@ -7172,11 +7276,9 @@ class SlackAdapter(BasePlatformAdapter):
         # may have been stored without a team id (metadata-poor send path)
         # while the click event carries one, and that mismatch must not
         # swallow a legitimate first click.
-        approval_key = self._workspace_message_marker(team_id, msg_ts)
-        if msg_ts in self._approval_resolved:
-            approval_key = msg_ts
         if self._approval_resolved.pop(approval_key, True):
             return
+        self._approval_requesters.pop(approval_key, None)
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)
@@ -7289,13 +7391,18 @@ class SlackAdapter(BasePlatformAdapter):
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
+        team_id = self._event_team_id({}, body)
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
+        clarify_key = self._workspace_message_marker(team_id, msg_ts)
+        if msg_ts in self._clarify_resolved:
+            clarify_key = msg_ts
+        expected_requester = self._clarify_requesters.get(clarify_key)
+        requester_matches = bool(expected_requester and user_id == expected_requester)
+
+        if not requester_matches and not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, user_name=user_name, team_id=team_id
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -7311,8 +7418,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).
-        if self._clarify_resolved.pop(msg_ts, True):
+        if self._clarify_resolved.pop(clarify_key, True):
             return
+        self._clarify_requesters.pop(clarify_key, None)
 
         # Preserve the original question so the resolved message keeps context.
         original_text = ""
