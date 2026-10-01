@@ -1068,7 +1068,11 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
         _parked_default_warned.add(default)
     if not multiplex:
         return [(active, get_profile_dir(active))]
-    serve: List[Tuple[str, Path]] = [("default", default)]
+    # Local patch (rooroosu): a named multiplex host (Luffy) must not also SERVE the
+    # root home -- a root+Luffy boot race stole the Telegram token. Roster callers
+    # (include_* flags) still see default.
+    serving = not (include_standalone or include_parked)
+    serve: List[Tuple[str, Path]] = [] if serving and active != "default" else [("default", default)]
     serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()
                  if (include_standalone or not profile_is_standalone(entry))
                  and (include_parked or not profile_is_parked(entry)))

@@ -362,6 +362,41 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _resolve_delegated_profile(profile: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Local patch (rooroosu): validate a model-selected specialist profile and load its SOUL only.
+
+    The child stays a fresh, isolated session: it gets the profile's identity, not its
+    credentials, memory, or runtime state."""
+    if profile is None or not str(profile).strip():
+        return None, None
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists, validate_profile_name
+
+    canonical = normalize_profile_name(str(profile))
+    validate_profile_name(canonical)
+    if canonical == "default" or not profile_exists(canonical):
+        raise ValueError(f"Unknown delegated profile: {canonical}")
+    try:
+        soul = (get_profile_dir(canonical) / "SOUL.md").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        soul = ""
+    except OSError as exc:
+        raise ValueError(f"Could not read delegated profile {canonical}") from exc
+    return canonical, soul or None
+
+
+def _profile_context_prefix(profile_name: Optional[str], profile_soul: Optional[str]) -> str:
+    if not profile_name:
+        return ""
+    text = (
+        "SPECIALIST PROFILE:\n"
+        f"You are acting as the configured Hermes profile '{profile_name}'. "
+        "Keep that profile's identity and remit while completing only the delegated task.\n\n"
+    )
+    if profile_soul:
+        text += f"PROFILE IDENTITY:\n{profile_soul}\n\n"
+    return text
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
@@ -379,10 +414,15 @@ def _build_children(
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
     }
+    # Local patch (rooroosu): resolve every task's specialist profile before building any child.
+    try:
+        task_profiles = [_resolve_delegated_profile(t.get("profile")) for t in task_list]
+    except ValueError as exc:
+        return [], str(exc)
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
-        _child_context = t.get("context")
+        _child_context = _profile_context_prefix(*task_profiles[i]) + (t.get("context") or "") or None
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
@@ -677,6 +717,12 @@ DELEGATE_TASK_SCHEMA = {
                             "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
                             "files do NOT belong here — put paths in 'context' instead.",
                             items={"type": "string"},
+                        ),
+                        "profile": _p(
+                            "string",
+                            "Optional existing Hermes specialist profile (e.g. nami, chopper, franky) whose SOUL "
+                            "identity this child adopts. The child stays an isolated session and does not inherit "
+                            "that profile's credentials or memory.",
                         ),
                         "group": _p(
                             "string",
