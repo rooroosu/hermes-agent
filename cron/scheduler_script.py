@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -478,6 +479,29 @@ def _run_job_script_with_claim_heartbeat(
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+_NOISE_LINE = re.compile(
+    r'^(?:File ".*|Traceback \(most recent call last\):|stderr:|stdout:|\^+|~+|Script exited with code -?\d+)$')
+
+
+def _no_agent_failure_line(job_name: str, output: str) -> str:
+    """One Korean line for a failed script job: last meaningful stderr line, paths → basenames, ≤200.
+    The full output stays in the saved run document."""
+    text = str(output or "")
+    if text.lower().startswith("script timed out"):
+        reason = "시간 초과"
+    else:
+        def _meaningful(block: str) -> list:
+            return [ln.strip() for ln in block.splitlines() if ln.strip() and not _NOISE_LINE.match(ln.strip())]
+        # Runner layout: "Script exited with code N\nstderr:\n…\nstdout:\n…" — stdout is last, so
+        # prefer the stderr section and fall back to the whole text.
+        m = re.search(r"(?:^|\n)stderr:\n(.*?)(?:\nstdout:\n|\Z)", text, re.S)
+        lines = (_meaningful(m.group(1)) if m else []) or _meaningful(text)
+        reason = lines[-1] if lines else "스크립트가 오류로 끝났습니다"
+        reason = reason.removeprefix("HERMES-FAIL:").strip()
+        reason = re.sub(r"(?:/[^\s/'\":]+)+/([^\s/'\":]+)", r"\1", reason)
+    return f"⚠ 크론 실패: {job_name} — {reason}"[:200]
 
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully

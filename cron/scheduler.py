@@ -1516,11 +1516,7 @@ def _run_no_agent_job(
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
-        alert = (
-            f"⚠ Cron watchdog '{job_name}' script failed\n\n"
-            f"{output}\n\n"
-            f"Time: {now_iso}"
-        )
+        alert = _no_agent_failure_line(job_name, output)
         return False, f"{header}**Status:** script failed\n\n{output}\n", alert, output
 
     # wakeAgent=false is a silent signal, same as empty stdout.
@@ -2845,6 +2841,9 @@ def _compose_run_delivery(
         )
         if incident_acked:
             deliver_content = ""
+        elif job.get("no_agent") and str(final_response or "").startswith("⚠ 크론 실패:"):
+            # Script job: deliver its one Korean line as-is (no English nudge/summary lines).
+            deliver_content = final_response
         elif agent_declared:
             # The agent already diagnosed the failure in prose; the summarizer's substring
             # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
@@ -4158,7 +4157,8 @@ from cron.scheduler_delivery import (  # noqa: E402
     _resolve_delivery_targets,
 )
 from cron.scheduler_script import (  # noqa: E402
-    _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
+    _get_session_db_timeout, _no_agent_failure_line, _run_job_script_with_claim_heartbeat,
+    _start_heartbeat_thread,
 )
 from cron.scheduler_prompt import (  # noqa: E402
     _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil, _parse_wake_gate,

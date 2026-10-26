@@ -270,3 +270,76 @@ def test_agent_job_provider_classification_unchanged(error, expected):
 
     job = {"name": "daily-digest", "no_agent": False}
     assert expected in _summarize_cron_failure_for_delivery(job, error)
+
+
+# ---------------------------------------------------------------------------
+# Owner-facing failure alert: one Korean line, no paths/tracebacks (2026-10-26)
+# ---------------------------------------------------------------------------
+
+
+def _deliver_failure(job, monkeypatch):
+    import cron.scheduler as s
+    from cron.scheduler import run_job
+
+    monkeypatch.setattr(s, "_upsert_incident_for_failure", lambda *_a, **_kw: (False, None))
+    success, doc, final_response, error = run_job(job)
+    assert success is False
+    text, *_ = s._compose_run_delivery(
+        job, success=False, error=error, final_response=final_response, output_file=None)
+    return doc, text
+
+
+def test_no_agent_traceback_failure_delivers_one_korean_line(hermes_env, monkeypatch):
+    from cron.jobs import create_job
+
+    (hermes_env / "scripts" / "boom.sh").write_text(
+        "#!/bin/bash\n"
+        "echo 'Traceback (most recent call last):' >&2\n"
+        "echo '  File \"/Users/x/proj/tool.py\", line 3, in <module>' >&2\n"
+        "echo '    load()' >&2\n"
+        "echo \"FileNotFoundError: [Errno 2] No such file: '/Users/x/proj/data/y.json'\" >&2\n"
+        "echo 'partial stdout noise'\n"
+        "exit 1\n")
+    job = create_job(prompt=None, schedule="every 5m", script="boom.sh", no_agent=True,
+                     deliver="local", name="데이터 동기화")
+    doc, text = _deliver_failure(job, monkeypatch)
+
+    assert text.startswith("⚠ 크론 실패: 데이터 동기화 — FileNotFoundError")
+    assert "\n" not in text and len(text) <= 200
+    assert "/" not in text and "y.json" in text
+    assert "Traceback" not in text and "code 1" not in text and job["id"] not in text
+    # Full output kept in the saved run document.
+    assert "File \"/Users/x/proj/tool.py\"" in doc and "partial stdout noise" in doc
+
+
+def test_no_agent_failure_strips_machine_token_from_owner_alert(hermes_env, monkeypatch):
+    from cron.jobs import create_job
+
+    (hermes_env / "scripts" / "health.sh").write_text(
+        "#!/bin/bash\n"
+        "echo 'health check diagnostics' >&2\n"
+        "echo '  HERMES-FAIL:   게이트웨이 상태 확인에 실패했습니다  ' >&2\n"
+        "echo 'partial stdout noise'\n"
+        "exit 1\n")
+    job = create_job(prompt=None, schedule="every 5m", script="health.sh", no_agent=True,
+                     deliver="local", name="cron-health-watch")
+    doc, text = _deliver_failure(job, monkeypatch)
+
+    assert text == "⚠ 크론 실패: cron-health-watch — 게이트웨이 상태 확인에 실패했습니다"
+    assert "HERMES-FAIL:" in doc
+
+
+def test_no_agent_timeout_delivers_korean_timeout_line(hermes_env, monkeypatch):
+    import cron.scheduler as s
+    from cron.jobs import create_job
+
+    (hermes_env / "scripts" / "slow.sh").write_text("#!/bin/bash\nexit 0\n")
+    monkeypatch.setattr(
+        s, "_run_job_script_with_claim_heartbeat",
+        lambda *_a, **_kw: (False, "Script timed out after 3600s: /Users/x/.hermes/scripts/slow.sh"))
+    job = create_job(prompt=None, schedule="every 5m", script="slow.sh", no_agent=True,
+                     deliver="local", name="local CI")
+    doc, text = _deliver_failure(job, monkeypatch)
+
+    assert text == "⚠ 크론 실패: local CI — 시간 초과"
+    assert "Script timed out after 3600s" in doc
