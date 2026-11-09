@@ -447,10 +447,46 @@ def _route_overrides(route: Any) -> dict[str, Any]:
     }
 
 
+def _resolve_delegated_profile(profile: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Local patch (rooroosu): validate a model-selected specialist profile and load its SOUL only.
+
+    The child stays a fresh, isolated session: it gets the profile's identity, not its
+    credentials, memory, or runtime state (unlike upstream's trusted-config ``profile`` route)."""
+    if profile is None or not str(profile).strip():
+        return None, None
+    from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists, validate_profile_name
+
+    canonical = normalize_profile_name(str(profile))
+    validate_profile_name(canonical)
+    if canonical == "default" or not profile_exists(canonical):
+        raise ValueError(f"Unknown delegated profile: {canonical}")
+    try:
+        soul = (get_profile_dir(canonical) / "SOUL.md").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        soul = ""
+    except OSError as exc:
+        raise ValueError(f"Could not read delegated profile {canonical}") from exc
+    return canonical, soul or None
+
+
+def _profile_context_prefix(profile_name: Optional[str], profile_soul: Optional[str]) -> str:
+    if not profile_name:
+        return ""
+    text = (
+        "SPECIALIST PROFILE:\n"
+        f"You are acting as the configured Hermes profile '{profile_name}'. "
+        "Keep that profile's identity and remit while completing only the delegated task.\n\n"
+    )
+    if profile_soul:
+        text += f"PROFILE IDENTITY:\n{profile_soul}\n\n"
+    return text
+
+
 def _build_children(
     task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], routes: list[Any], *,
     top_role: str, max_iterations: int, parent_agent,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
+    task_profiles: Optional[list[tuple[Optional[str], Optional[str]]]] = None,
 ) -> tuple[list[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe), each on its task's route;
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -462,7 +498,9 @@ def _build_children(
         if route.error:
             continue  # refused by its backend: no child; its result entry is the refusal
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
-        _child_context = t.get("context")
+        # Local patch (rooroosu): per-task specialist profile -> SOUL identity prefix.
+        _prof = task_profiles[i] if task_profiles and i < len(task_profiles) else (None, None)
+        _child_context = _profile_context_prefix(*_prof) + (t.get("context") or "") or None
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
@@ -601,6 +639,16 @@ def delegate_task(
         )
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    task_profiles: list[tuple[Optional[str], Optional[str]]] = []
+    if not err:
+        # Local patch (rooroosu): resolve each task's specialist profile (SOUL only) and strip the key before
+        # routing, so the default backend does not refuse it as an undeclared parameter.
+        try:
+            task_profiles = [_resolve_delegated_profile(t.get("profile")) for t in task_list]
+        except ValueError as exc:
+            err = str(exc)
+        else:
+            task_list = [{k: v for k, v in t.items() if k != "profile"} for t in task_list]
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
@@ -654,6 +702,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        task_profiles=task_profiles,
     )
     if err:
         return tool_error(err)
@@ -821,6 +870,12 @@ DELEGATE_TASK_SCHEMA = {
                             "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
                             "files do NOT belong here — put paths in 'context' instead.",
                             items={"type": "string"},
+                        ),
+                        "profile": _p(
+                            "string",
+                            "Optional existing Hermes specialist profile (e.g. nami, chopper, franky) whose SOUL "
+                            "identity this child adopts. The child stays an isolated session and does not inherit "
+                            "that profile's credentials or memory.",
                         ),
                         "group": _p(
                             "string",
