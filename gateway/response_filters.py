@@ -223,20 +223,54 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
     return display_kind in MACHINERY_DISPLAY_KINDS
 
 
+def _current_turn_background_dispatch(agent_result: dict) -> bool:
+    """Trust only paired delegate_task results after the loop's proven turn boundary.
+
+    history_offset can become zero after compression; neither that offset nor a
+    user/tool prose mention proves that THIS turn admitted background work.
+    """
+    import json
+
+    messages = agent_result.get("messages", [])
+    start = agent_result.get("current_turn_user_idx")
+    if (type(start) is not int or not isinstance(messages, list)
+            or not 0 <= start < len(messages) or messages[start].get("role") != "user"):
+        return False
+    calls = set()
+    for message in messages[start + 1:]:
+        if message.get("role") == "assistant":
+            calls.update(call["id"] for call in message.get("tool_calls", [])
+                         if call.get("id") and call.get("function", {}).get("name") == "delegate_task")
+        elif message.get("role") == "tool" and message.get("tool_call_id") in calls:
+            calls.remove(message["tool_call_id"])
+            try:
+                payload = json.loads(message.get("content", ""))
+            except (TypeError, ValueError):
+                continue
+            if (isinstance(payload, dict) and payload.get("status") == "dispatched"
+                    and payload.get("mode") == "background" and payload.get("delegation_id")
+                    and type(payload.get("count")) is int and payload["count"] > 0
+                    and not any(payload.get(k) for k in (
+                        "error", "failed", "partial", "interrupted", "inline_results", "refused"))):
+                return True
+    return False
+
+
 def silence_allowed(
     display_kind: Any, reply_expected: Optional[bool] = None, *,
     allow_silence: Optional[bool] = None, agent_result: Optional[dict] = None,
 ) -> bool:
-    """Keep existing exemptions; room opt-in additionally requires a healthy completed result.
+    """Keep internal/unaddressed exemptions; other permissions require a healthy turn.
 
-    Marker recognition stays with the caller. Extra health restrictions apply only to the new
-    room permission, preserving the established internal/unaddressed semantics.
+    A successful current-turn background handoff permits waiting silently, not
+    dropping an actual answer. Marker recognition stays with the caller.
     """
     if is_machinery_display_kind(display_kind) or reply_expected is False:
         return True
-    return (allow_silence is True and isinstance(agent_result, dict)
+    return (isinstance(agent_result, dict)
             and not any(agent_result.get(k) for k in ("failed", "partial", "interrupted", "error"))
-            and agent_result.get("completed") is not False)
+            and agent_result.get("completed") is not False
+            and (allow_silence is True or _current_turn_background_dispatch(agent_result)))
 
 
 def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:
